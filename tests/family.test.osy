@@ -1,0 +1,66 @@
+// Booking for somebody else — a parent for a child, through Osysharp.Guardianship — and who sees whom on a session.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Guardianship;
+using Osysharp.ClassBookings;
+
+[Test(School)]
+void a_parent_books_her_son_and_the_booking_records_who_booked() {
+  runas (Ana) {
+    var got = BookSession(Cls("Kids' bread"), Leo);
+    Assert.Equal(BookingResult.Booked, got.Result);
+    Assert.Equal(Ana.Id, got.Booking!.BookedBy!.Id);
+    Assert.Equal(1, MyBookings().Count(l => l.Person == "Leo"));
+  }
+  runas (Ben) {
+    var refused = BookSession(Cls("Kids' bread"), Leo);
+    Assert.Equal(BookingResult.Refused, refused.Result);
+    Assert.Contains("someone you act for", refused.Message);
+  }
+}
+
+[Test(School)]
+void a_parent_cancels_and_answers_an_offer_for_her_son() {
+  runas (Ben) { BookSession(Cls("Sushi"), Ben); }
+  runas (Ana) { BookSession(Cls("Sushi"), Leo); }
+  runas (Ben) { CancelBooking(Mine("Sushi", Ben)); }
+  runas (Ana) {
+    Assert.Equal(BookingResult.Booked, AcceptOffer(Mine("Sushi", Leo)).Result);
+    Assert.Equal(BookingResult.Cancelled, CancelBooking(Mine("Sushi", Leo)).Result);
+  }
+}
+
+[Test(School)]
+void the_timetable_shows_each_class_from_the_childs_side() {
+  runas (Ana) {
+    BookSession(Cls("Kids' bread"), Leo);
+    var forLeo = Timetable(DateTime.UtcNow, 14, Leo).Single(l => l.Title == "Kids' bread");
+    Assert.Equal("Booked", forLeo.Mine);
+    var forAna = Timetable(DateTime.UtcNow, 14, Ana).Single(l => l.Title == "Kids' bread");
+    Assert.Equal("", forAna.Mine);
+    Assert.Equal(5, forAna.Left);
+    Assert.Equal("This class needs the knife-skills certificate first.", Timetable(DateTime.UtcNow, 14, Ana).Single(l => l.Title == "Knife skills").Refusal);
+  }
+}
+
+[Test(School)]
+void a_stranger_sees_the_places_but_never_who_holds_them() {
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); }
+  runas (Ben) {
+    Assert.Equal(1, PlacesLeft(Cls("Pasta")));
+    Assert.Equal(1, Booking.Count(b => b.Session.Id == Cls("Pasta").Id));
+    Assert.Null(Booking.Single(b => b.Session.Id == Cls("Pasta").Id).Person);
+    Assert.Equal("A booked place", RegisterOf(Cls("Pasta"))[0].Name);
+  }
+  runas (Omar) { Assert.Equal("Ana", RegisterOf(Cls("Pasta"))[0].Name); }
+}
+
+[Test(School)]
+void the_chef_sees_who_is_booked_on_his_class_only() {
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); BookSession(Cls("Sushi"), Ana); }
+  runas (Omar) { AssignResource(Cls("Pasta"), Res("Chef Sam")); }
+  runas (Sam) {
+    Assert.Equal("Ana", RegisterOf(Cls("Pasta"))[0].Name);
+    Assert.Equal("A booked place", RegisterOf(Cls("Sushi"))[0].Name);
+  }
+}

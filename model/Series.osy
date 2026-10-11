@@ -1,0 +1,104 @@
+// Sessions that repeat: every Tuesday at 18:00 in the app's own time zone, from a first day to a last — planned ahead as
+// real sessions, each of which can then be moved or cancelled on its own. A course is a series a person books whole.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Identity;
+
+/// A weekly session: on `Day`, at `StartsAt` local time in `TimeZone`, for `Length`, every `EveryWeeks` weeks from `From`
+/// until `Until` (or for as long as it is planned). Daylight saving is the zone's: 18:00 stays 18:00 all year.
+public entity SessionSeries {
+  [Required, MaxLength(160)] string Title;
+  Zone TimeZone;
+  DayOfWeek Day;
+  TimeOnly StartsAt;
+  TimeSpan Length = TimeSpan.FromHours(1);
+  [Min(1)] int EveryWeeks = 1;
+  [Min(0)] int Capacity;
+  DateOnly From;
+  DateOnly? Until;
+  /// Who leads it and where — every session planned from it holds them (`AssignResource`).
+  SessionResource? Lead;
+  SessionResource? Place;
+
+  security {
+    allow read when IsAuthenticated;
+    allow create, update when ManagesSessions;
+  }
+}
+
+/// What planning a series did: the sessions it made, and the days it could not hold a resource on.
+public class SeriesPlan {
+  public int Made;
+  public List<string> Clashes = [];
+}
+
+/// The days of `series` from its first through `through` (and its last, if it has one).
+public List<DateOnly> SeriesDays(SessionSeries series, DateOnly through) {
+  List<DateOnly> days = [];
+  var last = series.Until != null && series.Until.Value < through ? series.Until.Value : through;
+  var day = series.From;
+  while (day.DayOfWeek != series.Day) { day = day.AddDays(1); }
+  while (day <= last && days.Count < 520) {
+    days.Add(day);
+    day = day.AddDays(7 * series.EveryWeeks);
+  }
+  return days;
+}
+
+/// Make the sessions of `series` through `through` that are not made yet — the app's own kind of session
+/// (`ClassBookingsSetup.Maker`) — holding the series' lead and place. A day whose session was moved or cancelled stays as it is.
+/// A day a resource is busy is still made, without that resource, and named in the answer.
+[Server, Authorize(ManagesSessions)]
+public SeriesPlan PlanSeries(SessionSeries series, DateOnly through) {
+  var plan = new SeriesPlan();
+  var maker = App.Setting<ClassBookingsSetup>().Maker;
+  var made = BookableSession.Where(s => s.Series == series).Select(s => s.OccurrenceOn).Take(1000).ToList();
+  foreach (var day in SeriesDays(series, through)) {
+    if (made.Contains(day)) { continue; }
+    var starts = series.TimeZone.Resolve(day, series.StartsAt);
+    if (starts <= DateTime.UtcNow) { continue; }
+    var session = maker.New(series.Title, starts, starts + series.Length, series.Capacity);
+    session.Series = series;
+    session.OccurrenceOn = day;
+    UnitOfWork.Commit();
+    plan.Made = plan.Made + 1;
+    List<SessionResource> holds = [];
+    if (series.Lead != null) { holds.Add(series.Lead!); }
+    if (series.Place != null) { holds.Add(series.Place!); }
+    foreach (var r in holds) {
+      try { AssignResource(session, r); }
+      catch (ValidationException e) { UnitOfWork.Discard(); plan.Clashes.Add(day.ToString("d MMMM") + ": " + e.Message); }
+    }
+  }
+  return plan;
+}
+
+/// The sessions of `series` from now on, soonest first.
+public List<BookableSession> UpcomingOf(SessionSeries series) {
+  var now = DateTime.UtcNow;
+  return BookableSession.Where(s => s.Series == series && s.StartsAt > now).OrderBy(s => s.StartsAt).Take(200).ToList();
+}
+
+/// Book `person` into every upcoming session of `series` — a course, booked whole. Answers what each booking did; a full
+/// session puts them on its waiting list like any booking.
+[Server, Authorize(BooksSessions)]
+public List<BookingOutcome> BookSeries(SessionSeries series, Principal person) {
+  List<BookingOutcome> outcomes = [];
+  foreach (var s in UpcomingOf(series)) { outcomes.Add(BookSession(s, person)); }
+  return outcomes;
+}
+
+/// End a series from `from` on: its sessions from that day are cancelled (everyone booked hears it), and nothing more is
+/// planned. Answers how many sessions were cancelled.
+[Server, Authorize(ManagesSessions)]
+public int EndSeries(SessionSeries series, DateOnly from) {
+  var cancelled = 0;
+  foreach (var s in BookableSession.Where(s => s.Series == series && s.OccurrenceOn >= from && !s.Cancelled).Take(500).ToList()) {
+    CancelSession(s);
+    cancelled = cancelled + 1;
+  }
+  series.Until = from.AddDays(-1);
+  UnitOfWork.Commit();
+  return cancelled;
+}

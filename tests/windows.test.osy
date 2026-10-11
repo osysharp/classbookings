@@ -1,0 +1,82 @@
+// When booking opens and closes, and what cancelling late means.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.ClassBookings;
+
+[Test(School)]
+void booking_opens_when_the_school_says() {
+  SchoolOpensBefore.Stub(() => TimeSpan.FromDays(2));
+  runas (Ana) {
+    var early = BookSession(Cls("Pasta"), Ana);                 // five days ahead: not open yet
+    Assert.Equal(BookingResult.Refused, early.Result);
+    Assert.Contains("Booking opens on", early.Message);
+  }
+  TestClock.Advance(TimeSpan.FromDays(3) + TimeSpan.FromMinutes(1));
+  runas (Ana) { Assert.Equal(BookingResult.Booked, BookSession(Cls("Pasta"), Ana).Result); }
+}
+
+[Test(School)]
+void booking_closes_when_the_school_says() {
+  SchoolClosesBefore.Stub(() => TimeSpan.FromHours(6));
+  TestClock.Advance(TimeSpan.FromDays(5) - TimeSpan.FromHours(5));
+  runas (Ana) {
+    var got = BookSession(Cls("Pasta"), Ana);
+    Assert.Equal(BookingResult.Closed, got.Result);
+    Assert.Contains("has closed", got.Message);
+  }
+}
+
+[Test(School)]
+void cancelling_in_good_time_is_free_and_cancelling_late_is_recorded_and_heard() {
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); }
+  runas (Ben) { BookSession(Cls("Pasta"), Ben); }
+  runas (Ana) {
+    Assert.False(CancellingIsLate(Mine("Pasta", Ana)));
+    var free = CancelBooking(Mine("Pasta", Ana));
+    Assert.Equal("Booking cancelled.", free.Message);
+    Assert.False(Mine("Pasta", Ana).LateCancel);
+  }
+  TestClock.Advance(TimeSpan.FromDays(5) - TimeSpan.FromHours(3));
+  runas (Ben) {
+    Assert.True(CancellingIsLate(Mine("Pasta", Ben)));
+    var late = CancelBooking(Mine("Pasta", Ben));
+    Assert.Contains("late", late.Message);
+    Assert.True(Mine("Pasta", Ben).LateCancel);
+  }
+  Assert.Equal(1, HeardCount("late"));
+}
+
+[Test(School)]
+void the_desk_waives_a_late_cancellation_and_a_member_cannot() {
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); }
+  runas (Ben) { BookSession(Cls("Pasta"), Ben); }
+  TestClock.Advance(TimeSpan.FromDays(5) - TimeSpan.FromHours(3));
+  runas (Omar) { CancelBooking(Mine("Pasta", Ana), waive: true); }
+  runas (Ben) { CancelBooking(Mine("Pasta", Ben), waive: true); }
+  runas (Omar) {
+    Assert.False(Mine("Pasta", Ana).LateCancel);
+    Assert.True(Mine("Pasta", Ben).LateCancel);
+  }
+  Assert.Equal(1, HeardCount("late"));
+}
+
+[Test(School)]
+void leaving_the_waiting_list_is_never_late() {
+  runas (Ana) { BookSession(Cls("Sushi"), Ana); }
+  runas (Ben) { BookSession(Cls("Sushi"), Ben); }
+  TestClock.Advance(TimeSpan.FromDays(5));
+  runas (Ben) { CancelBooking(Mine("Sushi", Ben)); }
+  Assert.Equal(0, HeardCount("late"));
+}
+
+[Test(School)]
+void once_a_session_has_started_only_the_desk_cancels() {
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); }
+  TestClock.Advance(TimeSpan.FromDays(5) + TimeSpan.FromMinutes(5));
+  runas (Ana) {
+    var got = CancelBooking(Mine("Pasta", Ana));
+    Assert.Equal(BookingResult.Refused, got.Result);
+    Assert.Contains("Ask the desk", got.Message);
+  }
+  runas (Omar) { Assert.Equal(BookingResult.Cancelled, CancelBooking(Mine("Pasta", Ana)).Result); }
+}

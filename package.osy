@@ -1,0 +1,30 @@
+// Osysharp.ClassBookings — bookable sessions with a fixed number of places: a class, a clinic, a course meeting, a lesson, an
+// appointment slot that several people share.
+//
+// A person books a numbered place, or joins a first-come waiting list when it is full; a freed place is offered to the
+// next in line for a limited time (or given to them at once), on a durable clock. Booking opens and closes when the app
+// says, cancelling late is recorded and heard, and the register is taken at the door — checked in, walked in, or marked
+// absent when it closes. Sessions repeat weekly as a series, in the app's own time zone; instructors, rooms and equipment
+// are resources a session holds and no two sessions share at once. People book for those they act for.
+//
+// ⚑ NOTHING EVER OVERBOOKS — the data refuses it. A held place is a numbered seat, unique per session and never above the
+//   session's capacity; a booking's state and seat change only through the kit's functions.
+//
+// ⚑ THE APP SAYS WHO RUNS IT, AND DERIVES ITS OWN KIND OF SESSION:
+//     policy ManagesSessions => IsDesk;
+//     policy TakesAttendance => IsDesk || IsInstructor;     // a session's own instructor takes its register anyway
+//     policy BooksFor(Principal person) => person == user || ActsForDependant(person);
+//     entity CookingClass : BookableSession { … }
+//   …and adds booking rules by implementing `IBookingRule` (found, never wired). Money is the app's: a late cancellation
+//   or a no-show is an event it charges for with its own payments.
+package Osysharp.ClassBookings {
+  version     "0.1.0";
+  minPlatform "0.9.0";
+  summary     "bookable sessions with numbered places that are never overbooked — a first-come waiting list whose freed places are offered for a limited time (or given at once) on a durable clock, booking windows, late cancellation and no-shows heard as events for the app to charge, check-in, walk-ins and the register closing by itself, weekly series in the app's time zone with one-off changes, instructors, rooms and equipment that no two sessions hold at once, reminders before a session, app-defined booking rules, booking for the people one acts for — with a timetable, a my-bookings page and the register.";
+  pairsWith   "Osysharp.Guardianship: parents book classes and courses for the children they act for";
+  model "model/**/*.osy";
+  use Osysharp.Identity@0;   // `Principal`: who holds a booking
+  use Osysharp.Ui;
+  use Osysharp.Workflow;     // the durable clocks: an offer's window, a session's reminders and its register
+  tests "tests";
+}

@@ -1,0 +1,136 @@
+// The timetable: the next two weeks, day by day — each session with its time, who leads it and where, the places left,
+// and the one thing the person can do about it now: book, join the waiting list, take an offered place, or cancel. A
+// person who books for others chooses whom it is for.
+//
+// ⚑ EVERY LOOK TOKEN COMES FROM THE THEME: no colour, size or font is written here, so a look (`kits/look-*`) re-skins it.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Identity;
+using Osysharp.Ui;
+
+/// The timetable. In a test: `Ui.Click("Book", within: "Pasta")`, `Ui.Click("Join the waiting list", within: "Sushi")`,
+/// `Ui.Click("Take the place", within: "Sushi")`, `Ui.Click("Cancel", within: "Pasta")` — and, for a person who books for
+/// others, `Ui.Click("Leo", within: "Booking for")` first.
+[Composable]
+public component TimetableScreen(int days = 14) {
+  List<SessionLine> lines = [];
+  List<Principal> people = [];
+  Principal? forWhom = null;
+  string notice = "";
+  bool noticeIsProblem = false;
+  Guid cancelling = Guid.Empty;
+  string cancellingTitle = "";
+  bool cancellingLate = false;
+
+  on mount {
+    people = PeopleIBookFor();
+    forWhom = people.Count > 0 ? people[0] : CurrentPrincipal();
+    Load();
+  }
+
+  action Load() { lines = Timetable(DateTime.UtcNow, days, forWhom!); }
+  action ChooseFor(Principal p) { forWhom = p; Load(); }
+
+  action Show(BookingOutcome o) {
+    notice = o.Message;
+    noticeIsProblem = o.Result == BookingResult.Refused || o.Result == BookingResult.Closed || o.Result == BookingResult.SessionCancelled
+                      || o.Result == BookingResult.Lapsed;
+    Load();
+  }
+  action Book(SessionLine l) { Show(BookSession(BookableSession.Single(s => s.Id == l.Id), forWhom!)); }
+  action Take(SessionLine l) { Show(AcceptOffer(Booking.Single(b => b.Id == l.BookingId))); }
+  action Decline(SessionLine l) { Show(DeclineOffer(Booking.Single(b => b.Id == l.BookingId))); }
+  action AskCancel(SessionLine l) { cancelling = l.BookingId ?? Guid.Empty; cancellingTitle = l.Title; cancellingLate = l.LateIfCancelled; }
+  action StopCancel() { cancelling = Guid.Empty; }
+  action Cancel() {
+    var id = cancelling;
+    cancelling = Guid.Empty;
+    Show(CancelBooking(Booking.Single(b => b.Id == id)));
+  }
+
+  render {
+    Stack(gap: 6, maxW: "60rem", w: "100%", mx: "auto", px: 4, py: 6) {
+      PageHead("Timetable", subtitle: "Book a place, or join the waiting list when a session is full.");
+      if (people.Count > 1) {
+        Stack(gap: 1, label: "Booking for") {
+          Text("Booking for", fontSize: FontSize.Label, fontWeight: FontWeight.Medium);
+          Row(gap: 2, wrap: Wrapping.Wrap) {
+            foreach (var p in people) {
+              Button(p.DisplayName != "" ? p.DisplayName : p.Email, onPress: () => ChooseFor(p), size: Size.Sm,
+                     tone: forWhom != null && forWhom!.Id == p.Id ? Tone.Primary : Tone.Default);
+            }
+          }
+        }
+      }
+      if (notice != "") { Alert(notice, tone: noticeIsProblem ? Tone.Warning : Tone.Success); }
+      if (lines.Count == 0) { EmptyState("Nothing on the timetable", body: "No sessions in the next " + days + " days."); }
+      foreach (var day in lines.Select(l => l.StartsAt.Date).Distinct().ToList()) {
+        Stack(gap: 2, label: day.ToString("dddd d MMMM")) {
+          SectionLabel(day.ToString("dddd d MMMM"));
+          Stack(gap: 0, role: UiRole.List, label: "Sessions on " + day.ToString("dddd d MMMM")) {
+            foreach (var l in lines.Where(x => x.StartsAt.Date == day).ToList()) {
+              SessionRow(l, onBook: Book, onTake: Take, onDecline: Decline, onCancel: AskCancel);
+            }
+          }
+        }
+      }
+    }
+    if (cancelling != Guid.Empty) {
+      Dialog("Cancel " + cancellingTitle + "?", onDismiss: StopCancel,
+             subtitle: cancellingLate ? "This is inside the cancellation window, so it counts as a late cancellation."
+                                      : "Your place goes to the next person waiting.") {
+        Row(gap: 2, justify: Justify.End) {
+          Button("Keep it", onPress: StopCancel, tone: Tone.Ghost);
+          Button(cancellingLate ? "Cancel late" : "Cancel the booking", onPress: Cancel, tone: Tone.Danger);
+        }
+      }
+    }
+  }
+}
+
+/// One session on the timetable, with what the person can do about it.
+[Composable]
+public component SessionRow(SessionLine l, Action<SessionLine> onBook, Action<SessionLine> onTake, Action<SessionLine> onDecline,
+                            Action<SessionLine> onCancel) {
+  render {
+    Row(gap: 4, align: Align.Center, py: 3, borderBW: 1, border: Colors.Border, wrap: Wrapping.Wrap, role: UiRole.ListItem, label: l.Title) {
+      Stack(gap: 0, minW: "5rem") {
+        Text(l.StartsAt.ToString("HH:mm"), fontWeight: FontWeight.Semibold);
+        Text(l.EndsAt.ToString("HH:mm"), fontSize: FontSize.Label, color: Colors.TextMuted);
+      }
+      Stack(gap: 1, grow: 1, minW: "0") {
+        Text(l.Title, fontWeight: FontWeight.Medium);
+        if (l.With != "") { Text(l.With, fontSize: FontSize.Label, color: Colors.TextSecondary); }
+      }
+      if (l.Cancelled) {
+        Badge("Cancelled", tone: Tone.Danger);
+      } else if (l.Mine == "Booked") {
+        Badge(l.Seat != null ? $"Booked · place {l.Seat}" : "Booked", tone: Tone.Success);
+        Button("Cancel", onPress: () => onCancel(l), tone: Tone.Ghost, size: Size.Sm, announceAs: "Cancel " + l.Title);
+      } else if (l.Mine == "Attended") {
+        Badge("Checked in", tone: Tone.Success);
+      } else if (l.Mine == "Offered") {
+        Stack(gap: 1, align: Align.End) {
+          Badge("A place is held for you", tone: Tone.Warning);
+          if (l.OfferUntil != null) { Text("until " + l.OfferUntil.Value.ToString("d MMM HH:mm"), fontSize: FontSize.Caption, color: Colors.TextMuted); }
+        }
+        Button("Decline", onPress: () => onDecline(l), tone: Tone.Ghost, size: Size.Sm);
+        Button("Take the place", onPress: () => onTake(l), tone: Tone.Primary, size: Size.Sm);
+      } else if (l.Mine == "Waiting") {
+        Badge(l.Position != null ? $"Waiting · number {l.Position}" : "Waiting", tone: Tone.Default);
+        Button("Leave the list", onPress: () => onCancel(l), tone: Tone.Ghost, size: Size.Sm, announceAs: "Leave the waiting list for " + l.Title);
+      } else if (l.Refusal != "") {
+        Text(l.Refusal, fontSize: FontSize.Label, color: Colors.TextSecondary, maxW: "18rem");
+      } else if (!l.Full) {
+        Text(l.Left == 1 ? "1 place left" : $"{l.Left} places left", fontSize: FontSize.Label, color: Colors.TextSecondary);
+        Button("Book", onPress: () => onBook(l), tone: Tone.Primary, size: Size.Sm, announceAs: "Book " + l.Title);
+      } else if (l.WaitlistOpen) {
+        Text(l.Waiting == 0 ? "Full" : $"Full · {l.Waiting} waiting", fontSize: FontSize.Label, color: Colors.TextSecondary);
+        Button("Join the waiting list", onPress: () => onBook(l), tone: Tone.Default, size: Size.Sm, announceAs: "Join the waiting list for " + l.Title);
+      } else {
+        Badge("Full", tone: Tone.Default);
+      }
+    }
+  }
+}

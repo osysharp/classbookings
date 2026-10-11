@@ -1,0 +1,120 @@
+// The register: check-in, walk-ins, absence — and the session's own clock, which reminds and closes.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Workflow;
+using Osysharp.ClassBookings;
+
+[Test(AtTheDoor)]
+void the_desk_checks_people_in_and_the_school_hears_it() {
+  runas (Omar) {
+    var got = CheckIn(Mine("Tonight", Ana));
+    Assert.Equal(BookingResult.CheckedIn, got.Result);
+    Assert.Equal(BookingState.Attended, Mine("Tonight", Ana).State);
+    Assert.NotNull(Mine("Tonight", Ana).CheckedInAt);
+    Assert.Equal(BookingResult.NothingToDo, CheckIn(Mine("Tonight", Ana)).Result);
+    UndoCheckIn(Mine("Tonight", Ana));
+    Assert.Equal(BookingState.Booked, Mine("Tonight", Ana).State);
+  }
+  Assert.Equal(1, HeardCount("checked-in"));
+}
+
+[Test(AtTheDoor)]
+void the_chef_takes_the_register_of_his_own_class_and_no_other() {
+  runas (Sam) {
+    Assert.Equal(2, RegisterOf(Cls("Tonight")).Count(l => l.State == BookingState.Booked));
+    Assert.Equal("Ana", RegisterOf(Cls("Tonight"))[0].Name);
+    Assert.Equal(BookingResult.CheckedIn, CheckIn(Mine("Tonight", Ben)).Result);
+  }
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); }
+  runas (Sam) {
+    Assert.Equal(BookingResult.Refused, CheckIn(Booking.Single(b => b.Session.Id == Cls("Pasta").Id)).Result);
+  }
+}
+
+[Test(AtTheDoor)]
+void a_member_checks_in_only_when_the_school_allows_it_and_only_near_the_start() {
+  runas (Ana) { Assert.Contains("desk", CheckIn(Mine("Tonight", Ana)).Message); }
+  SchoolSelfCheckIn.Stub(() => true);
+  runas (Ana) { Assert.Equal(BookingResult.CheckedIn, CheckIn(Mine("Tonight", Ana)).Result); }
+  runas (Ben) { BookSession(Cls("Pasta"), Ben); }
+  runas (Ben) { Assert.Contains("Check-in opens", CheckIn(Mine("Pasta", Ben)).Message); }
+}
+
+[Test(AtTheDoor)]
+void somebody_waiting_is_walked_in_when_a_place_is_free_and_never_past_the_places() {
+  runas (Omar) {
+    Assert.Equal(BookingResult.Refused, WalkIn(Cls("Tonight"), Cy).Result);           // two booked, two places
+    CancelBooking(Mine("Tonight", Ben), waive: true);
+  }
+  runas (Cy) { DeclineOffer(Mine("Tonight", Cy)); }
+  runas (Omar) {
+    var got = WalkIn(Cls("Tonight"), Dee);
+    Assert.Equal(BookingResult.CheckedIn, got.Result);
+    Assert.Equal(BookingState.Attended, Mine("Tonight", Dee).State);
+    Assert.Equal(Omar.Id, Mine("Tonight", Dee).BookedBy!.Id);
+  }
+}
+
+[Test(AtTheDoor)]
+void a_walk_in_with_no_account_gets_one_nobody_signs_in_to() {
+  runas (Omar) {
+    CancelBooking(Mine("Tonight", Ben), waive: true);
+    DeclineOffer(Mine("Tonight", Cy));
+    var stranger = App.Setting<ClassBookingsSetup>().People.NewWalkIn("Walk-in Wren");
+    Assert.NotNull(stranger);
+    Assert.Equal(BookingResult.CheckedIn, WalkIn(Cls("Tonight"), stranger!).Result);
+  }
+  runas (AuthBootstrap) { Assert.True(IsManaged(User.Single(u => u.DisplayName == "Walk-in Wren"))); }
+}
+
+[Test(AtTheDoor)]
+void nobody_is_absent_before_the_start_and_the_desk_marks_absence_after_it() {
+  runas (Omar) { Assert.Throws(() => MarkNoShow(Mine("Tonight", Ana))); }
+  TestClock.Advance(TimeSpan.FromMinutes(20));
+  runas (Omar) { MarkNoShow(Mine("Tonight", Ana)); }
+  Booking? bens = null;
+  runas (Omar) { bens = Mine("Tonight", Ben); }
+  runas (Ana) { Assert.Throws<NotAuthorized>(() => MarkNoShow(bens!)); }
+  Assert.Equal(1, HeardCount("no-show"));
+}
+
+[Test(AtTheDoor)]
+void the_register_closes_by_itself_after_the_class_and_marks_who_never_came() {
+  runas (Omar) { CheckIn(Mine("Tonight", Ana)); }
+  runas (Omar) { BookSession(Cls("Tonight"), Omar); }          // gives the class its clock
+  TestClock.Advance(TimeSpan.FromHours(3));
+  SettleClock("Tonight");
+  runas (Omar) {
+    Assert.NotNull(Cls("Tonight").RegisterClosedAt);
+    Assert.Equal(BookingState.Attended, Mine("Tonight", Ana).State);
+    Assert.Equal(BookingState.NoShow, Mine("Tonight", Ben).State);
+    Assert.Equal(BookingResult.Refused, CheckIn(Mine("Tonight", Ben)).Result);
+  }
+  Assert.Equal(1, HeardCount("no-show"));
+}
+
+[Test(School)]
+void everyone_booked_is_reminded_a_day_before() {
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); }
+  runas (Ben) { BookSession(Cls("Pasta"), Ben); }
+  runas (Cy) { BookSession(Cls("Pasta"), Cy); }                // waiting: not reminded
+  TestClock.Advance(TimeSpan.FromDays(3));
+  SettleClock("Pasta");
+  Assert.Equal(0, HeardCount("reminder"));
+  TestClock.Advance(TimeSpan.FromDays(1) + TimeSpan.FromMinutes(1));
+  SettleClock("Pasta");
+  Assert.Equal(2, HeardCount("reminder"));
+}
+
+[Test(School)]
+void a_moved_class_reminds_on_its_new_day() {
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); }
+  runas (Omar) { MoveSession(Cls("Pasta"), Cls("Pasta").StartsAt.AddDays(3)); }
+  TestClock.Advance(TimeSpan.FromDays(4) + TimeSpan.FromMinutes(1));
+  SettleClock("Pasta");
+  Assert.Equal(0, HeardCount("reminder"));
+  TestClock.Advance(TimeSpan.FromDays(3));
+  SettleClock("Pasta");
+  Assert.Equal(1, HeardCount("reminder"));
+  Assert.Equal(1, HeardCount("moved"));
+}

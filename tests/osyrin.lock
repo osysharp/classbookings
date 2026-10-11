@@ -1,0 +1,39 @@
+{
+  "platform": {
+    "version": "0.9.0"
+  },
+  "entries": [],
+  "bridges": {
+    "searched": [
+      "workspace",
+      "platform",
+      "github"
+    ],
+    "notIncluded": [
+      {
+        "name": "Osysharp.Conversations.Sms",
+        "reason": "completes Osysharp.Conversations \u002B Osysharp.Sms, and this app does not use \u0060Osysharp.Conversations\u0060."
+      },
+      {
+        "name": "Osysharp.IncidentReports.Guardianship",
+        "reason": "completes Osysharp.IncidentReports \u002B Osysharp.Guardianship, and this app does not use \u0060Osysharp.IncidentReports\u0060."
+      },
+      {
+        "name": "Osysharp.Privacy.ClassBookings",
+        "reason": "completes Osysharp.Privacy \u002B Osysharp.ClassBookings, and this app does not use \u0060Osysharp.Privacy\u0060."
+      },
+      {
+        "name": "Osysharp.Privacy.Guardianship",
+        "reason": "completes Osysharp.Privacy \u002B Osysharp.Guardianship, and this app does not use \u0060Osysharp.Privacy\u0060."
+      },
+      {
+        "name": "Osysharp.Privacy.Sms",
+        "reason": "completes Osysharp.Privacy \u002B Osysharp.Sms, and this app does not use \u0060Osysharp.Privacy\u0060."
+      },
+      {
+        "name": "Osysharp.Privacy.UserAccounts",
+        "reason": "completes Osysharp.Privacy \u002B Osysharp.UserAccounts, and this app does not use \u0060Osysharp.Privacy\u0060."
+      }
+    ]
+  }
+}

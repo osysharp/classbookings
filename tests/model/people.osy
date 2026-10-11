@@ -1,0 +1,87 @@
+// The school's people and classes, the fixtures the tests start from, and the helpers they read through.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Guardianship;
+using Osysharp.Workflow;
+using Osysharp.ClassBookings;
+
+User Member(string email, string name, AppRole role) {
+  var u = new User { Email = email, DisplayName = name, EmailVerifiedAt = DateTime.UtcNow };
+  new RoleGrant { Member = u, Role = role };
+  return u;
+}
+
+/// The school: Ana (who has a son, Leo), Ben, Cy, Dee and Eli take classes; Omar runs the desk; Sam is a chef. Two
+/// kitchens and Sam are its resources. Its classes start in five days, but for one that started yesterday and one the
+/// desk cancelled.
+[TestFixture]
+void School() { SeedSchool(); }
+
+/// What a layer above the school needs from it — a fixture's reads obey the app's rules, so it is handed over.
+class World {
+  public User Ana;
+  public User Ben;
+  public User Cy;
+  public SessionResource ChefSam;
+}
+
+World SeedSchool() {
+  var ana = Member("ana@larder.test", "Ana", AppRole.Member);
+  var ben = Member("ben@larder.test", "Ben", AppRole.Member);
+  var cy = Member("cy@larder.test", "Cy", AppRole.Member);
+  Member("dee@larder.test", "Dee", AppRole.Member);
+  Member("eli@larder.test", "Eli", AppRole.Member);
+  Member("omar@larder.test", "Omar", AppRole.Desk);
+  var sam = Member("sam@larder.test", "Sam", AppRole.Chef);
+  var leo = new User { Email = "leo@managed.invalid", DisplayName = "Leo" };
+  new Guardianship { Guardian = ana, Dependant = leo };
+  var chef = new SessionResource { Name = "Chef Sam", Kind = ResourceKind.Instructor, Person = sam };
+  new SessionResource { Name = "Kitchen 1", Kind = ResourceKind.Room, Capacity = 8 };
+  new SessionResource { Name = "Kitchen 2", Kind = ResourceKind.Room, Capacity = 2 };
+  var soon = DateTime.UtcNow.AddDays(5);
+  new CookingClass { Title = "Pasta", Cuisine = "Italian", StartsAt = soon, EndsAt = soon.AddHours(2), Capacity = 2 };
+  new CookingClass { Title = "Sushi", Cuisine = "Japanese", StartsAt = soon.AddHours(3), EndsAt = soon.AddHours(5), Capacity = 1 };
+  new CookingClass { Title = "Knife skills", StartsAt = soon.AddDays(1), Capacity = 4, NeedsKnifeSkills = true };
+  new CookingClass { Title = "Supper club", StartsAt = soon.AddDays(2), Capacity = 1, WaitlistOpen = false };
+  new CookingClass { Title = "Yesterday", StartsAt = DateTime.UtcNow.AddDays(-1), Capacity = 2 };
+  new CookingClass { Title = "Closed down", StartsAt = soon, Capacity = 2, Cancelled = true };
+  new CookingClass { Title = "Kids' bread", StartsAt = soon.AddDays(3), Capacity = 6 };
+  return new World { Ana = ana, Ben = ben, Cy = cy, ChefSam = chef };
+}
+
+/// …and a class starting in ten minutes, which Ana and Ben booked and Cy is waiting for: the register's world.
+[TestFixture]
+void AtTheDoor() {
+  var w = SeedSchool();
+  var ana = w.Ana;
+  var ben = w.Ben;
+  var cy = w.Cy;
+  var starts = DateTime.UtcNow.AddMinutes(10);
+  var tonight = new CookingClass { Title = "Tonight", StartsAt = starts, EndsAt = starts.AddHours(2), Capacity = 2 };
+  new Booking { Session = tonight, Person = ana, BookedBy = ana, State = BookingState.Booked, Seat = 1 };
+  new Booking { Session = tonight, Person = ben, BookedBy = ben, State = BookingState.Booked, Seat = 2 };
+  new Booking { Session = tonight, Person = cy, BookedBy = cy, State = BookingState.Waiting, Ticket = 1 };
+  new SessionAssignment { Session = tonight, Resource = w.ChefSam };
+}
+
+principal Ana => User.Single(u => u.Email == "ana@larder.test");
+principal Ben => User.Single(u => u.Email == "ben@larder.test");
+principal Cy => User.Single(u => u.Email == "cy@larder.test");
+principal Dee => User.Single(u => u.Email == "dee@larder.test");
+principal Eli => User.Single(u => u.Email == "eli@larder.test");
+principal Omar => User.Single(u => u.Email == "omar@larder.test");
+principal Sam => User.Single(u => u.Email == "sam@larder.test");
+principal Leo => User.Single(u => u.DisplayName == "Leo");
+
+CookingClass Cls(string title) { return CookingClass.Single(c => c.Title == title); }
+SessionResource Res(string name) { return SessionResource.Single(r => r.Name == name); }
+Booking Mine(string title, Principal person) { return Booking.Single(b => b.Session.Id == Cls(title).Id && b.Person.Id == person.Id); }
+int HeardCount(string kind) { Background.Settle(); return Heard.Count(h => h.Kind == kind); }
+
+// Direct writes, as whoever calls them — what the security tests expect to be refused.
+void WriteBooking(BookableSession s, Principal p, int seat) { new Booking { Session = s, Person = p, State = BookingState.Booked, Seat = seat }; }
+void SetState(Booking b, BookingState s) { b.State = s; }
+void SetSeat(Booking b, int seat) { b.Seat = seat; }
+void SetCapacityDirectly(BookableSession s, int c) { s.Capacity = c; }
+void SetStartDirectly(BookableSession s, DateTime at) { s.StartsAt = at; }
+void Assign(BookableSession s, SessionResource r) { new SessionAssignment { Session = s, Resource = r }; }

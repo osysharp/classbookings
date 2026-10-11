@@ -1,0 +1,244 @@
+// The seams, the setup, the session and the booking.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Identity;
+
+/// THE SEAM — who runs sessions: creates, moves and cancels them, changes their places, assigns instructors and rooms,
+/// and sees every booking with its person. Nobody, until the app says: `policy ManagesSessions => IsDesk;`.
+virtual policy ManagesSessions => false;
+
+/// THE SEAM — who takes the register: checks people in, walks them in, marks them absent, and reads who is booked. Whoever
+/// manages sessions, until the app widens it (`=> ManagesSessions || IsInstructor;`). A session's own instructor (a
+/// resource with their account) takes its register whatever this says.
+virtual policy TakesAttendance => ManagesSessions;
+
+/// THE SEAM — who may book at all. Anyone signed in, until the app narrows it: `policy BooksSessions => IsMember;`.
+virtual policy BooksSessions => IsAuthenticated;
+
+/// THE SEAM — may the caller book, cancel and answer offers for `person`? Asked of somebody other than the caller (a
+/// parent for a child, a carer for a client). Everybody acts for themself until the app says more:
+/// `policy BooksFor(Principal person) => person == user || ActsForDependant(person);`.
+virtual policy BooksFor(Principal person) => person == user;
+
+/// How the app configures the kit: `app.ClassBookings = new ClassBookingsSetup { CancelFreeUntil = TimeSpan.FromHours(24) };`.
+/// Every member has a working default.
+[AppSetting("ClassBookings")]
+public class ClassBookingsSetup {
+  /// How long a person has to take an offered place before it passes to the next in line.
+  public TimeSpan OfferWindow = TimeSpan.FromHours(2);
+  /// What happens when a place frees up: offer it to the first in line (`Offer`), or book them into it at once (`Promote`).
+  public WaitlistMode Waitlist = WaitlistMode.Offer;
+  /// How long before a session booking opens. Zero: as soon as the session exists.
+  public TimeSpan OpensBefore = TimeSpan.Zero;
+  /// How long before a session booking closes. Zero: when it starts.
+  public TimeSpan ClosesBefore = TimeSpan.Zero;
+  /// Cancelling a confirmed booking later than this before the start is a LATE cancellation: the place is still freed,
+  /// and the app hears `LateCancellation` (to charge a fee or take a credit, with its own payments). Zero: never late.
+  public TimeSpan CancelFreeUntil = TimeSpan.FromHours(12);
+  /// When a booked person is reminded before a session (the app hears `SessionReminder`). Zero: no reminder.
+  public TimeSpan RemindBefore = TimeSpan.FromHours(24);
+  /// How long after a session ends its register closes by itself: anyone booked and not checked in is marked absent,
+  /// and the app hears `NoShow`.
+  public TimeSpan CloseRegisterAfter = TimeSpan.FromMinutes(30);
+  /// May people check themselves in (a kiosk, their phone at the door) from `CheckInOpensBefore` the start until it ends?
+  public bool SelfCheckIn = false;
+  public TimeSpan CheckInOpensBefore = TimeSpan.FromMinutes(30);
+  /// The people a person books for, and how the desk finds and adds a walk-in — derive `SessionPeople` and override.
+  public SessionPeople People = new SessionPeople();
+  /// What kind of session a series makes — derive `SessionMaker` to make the app's own.
+  public SessionMaker Maker = new SessionMaker();
+}
+
+/// What a freed place does. ⚠ Appended, never inserted.
+public enum WaitlistMode {
+  /// Offered to the first in line, held for them for `OfferWindow`, then passed on.
+  [Label("Offer the place")] Offer,
+  /// Booked for the first in line at once; they hear `BookingConfirmed` and may cancel like anyone.
+  [Label("Book them at once")] Promote,
+}
+
+/// Who the pages offer and find. Derive and override:
+///
+///     public class Family : SessionPeople {
+///       public override List<Principal> BookableBy(Principal me) { return MeAndMyDependants(); }
+///       public override Principal? NewWalkIn(string name) { … MakeManagedAccount(name, false) … }
+///     }
+public class SessionPeople {
+  /// The people `me` may book for, themself first — the timetable's "Book for" choice.
+  public virtual List<Principal> BookableBy(Principal me) { return [me]; }
+  /// The people the desk finds for a walk-in by `text` (part of a name or an address).
+  public virtual List<Principal> Find(string text) {
+    var q = text.Trim();
+    if (q == "") { return []; }
+    return Principal.Where(p => p.IsActive && (p.DisplayName.Contains(q) || p.Email.Contains(q))).OrderBy(p => p.DisplayName).Take(20).ToList();
+  }
+  /// A person for a walk-in who has no account, by the name they gave; null when the app adds none (the register then
+  /// offers only people it finds).
+  public virtual Principal? NewWalkIn(string name) { return null; }
+}
+
+/// The kind of session a series makes. By default the kit's own `BookableSession`; an app that derives its own makes it
+/// with what it is given, and sets its own fields:
+///
+///     public override BookableSession New(string title, DateTime startsAt, DateTime endsAt, int capacity) {
+///       return new CookingClass { Title = title, StartsAt = startsAt, EndsAt = endsAt, Capacity = capacity, Cuisine = "Course" };
+///     }
+///
+/// The kit then marks it as the series' session for its day.
+public class SessionMaker {
+  public virtual BookableSession New(string title, DateTime startsAt, DateTime endsAt, int capacity) {
+    return new BookableSession { Title = title, StartsAt = startsAt, EndsAt = endsAt, Capacity = capacity };
+  }
+}
+
+/// A rule an app adds to booking — a class implementing it is found by the kit, nothing wires it. The first non-null
+/// refusal makes `BookSession` answer Refused with that sentence. Asked for a new booking, and again before a freed place
+/// reaches a person waiting. Runs as the caller.
+public interface IBookingRule {
+  string? Refusal(BookableSession session, Principal person);
+}
+
+/// The base an app derives its own sessions from — a class, a clinic, a lesson — adding its own fields. Whoever
+/// `ManagesSessions` reads, creates and edits it (the kit's grant, which `Extensible` adds to what the derived type
+/// states). Its places change only through `SetCapacity`, its times through `MoveSession`, and its cancellation through
+/// `CancelSession`, whoever writes. Grants are otherwise never inherited: the derived entity states who else reads it —
+/// `security { allow read when IsAuthenticated; }` — and without that only managers see its rows, so nobody can book.
+[Authority(Extensible)]
+public entity BookableSession {
+  [Required, MaxLength(160)] string Title;
+  DateTime StartsAt;
+  DateTime? EndsAt;
+  [Min(0)] int Capacity;
+  bool Cancelled = false;
+  bool WaitlistOpen = true;
+  /// The series it was planned from, and the day it stands for in that series — a moved occurrence keeps its day.
+  SessionSeries? Series;
+  DateOnly? OccurrenceOn;
+  /// When its register closed: from then on nobody is checked in or marked absent.
+  DateTime? RegisterClosedAt;
+
+  security {
+    allow read, create, update when ManagesSessions;
+    deny update Capacity except via SetCapacity;
+    deny update StartsAt, EndsAt except via MoveSession;
+    deny update Cancelled except via CancelSession;
+    deny update RegisterClosedAt except via CloseRegister;
+    deny update Series, OccurrenceOn except via PlanSeries;
+  }
+}
+
+/// Where a booking stands. ⚠ Appended, never inserted.
+public enum BookingState {
+  [Label("Booked")] Booked,
+  [Label("Waiting")] Waiting,
+  [Label("Place offered")] Offered,
+  [Label("Cancelled")] Cancelled,
+  [Label("Offer lapsed")] Lapsed,
+  [Label("Attended")] Attended,
+  [Label("Absent")] NoShow,
+}
+
+/// What a booking call did.
+public enum BookingResult { Booked, Waitlisted, AlreadyBooked, Refused, SessionCancelled, Closed, Cancelled, Lapsed, NothingToDo, CheckedIn }
+
+/// What happened, and a sentence to show.
+public class BookingOutcome {
+  public BookingResult Result;
+  public Booking? Booking;
+  public string Message = "";
+}
+
+/// One person's place — or place in the queue — in one session. One row per (session, person): booking again after a
+/// cancel reuses it. A Booked, Offered or Attended row holds a numbered Seat, and no two rows of a session hold the same.
+[Unique(Session, Person, "That person already has a booking for this session.")]
+[Unique(Session, Seat, "That place is already taken.")]
+[Unique(Session, Ticket, "That queue number is already taken.")]
+public entity Booking {
+  [Required, Immutable] BookableSession Session;
+  [Required, Immutable] Principal Person;
+  /// Who made the booking: the person, somebody who acts for them, or the desk.
+  Principal? BookedBy;
+  [ConcurrencyCheck] BookingState State;
+  /// The numbered place (1 … Capacity), held while Booked, Offered or Attended.
+  [Min(1), ConcurrencyCheck] int? Seat;
+  /// The queue number — lower is earlier in line. Set when the person joins the waiting list.
+  int? Ticket;
+  [Immutable] DateTime CreatedAt = DateTime.UtcNow;
+  DateTime? OfferedAt;
+  DateTime? OfferExpiresAt;
+  DateTime? CancelledAt;
+  /// Cancelled inside the free-cancellation window — what a fee or a lost credit is decided on.
+  bool LateCancel = false;
+  DateTime? CheckedInAt;
+
+  invariant Seat == null || Seat <= Session.Capacity message "That place does not exist in this session.";
+  invariant State != BookingState.Booked || Seat != null message "A confirmed booking holds a place.";
+  invariant State != BookingState.Offered || Seat != null message "An offered booking holds a place.";
+  invariant State != BookingState.Attended || Seat != null message "An attended booking holds a place.";
+  invariant State != BookingState.Waiting || Seat == null message "A waiting booking holds no place.";
+  invariant State != BookingState.Cancelled || Seat == null message "A cancelled booking holds no place.";
+  invariant State != BookingState.Lapsed || Seat == null message "A lapsed booking holds no place.";
+
+  security {
+    // Everybody signed in reads the rows, so counts and free places can be worked out as anybody — but who holds a row,
+    // who booked it and when are hidden from everyone but the person, those who booked or act for them, and the staff.
+    allow read when IsAuthenticated;
+    deny read Person, BookedBy, CreatedAt, OfferedAt, OfferExpiresAt, CancelledAt, CheckedInAt when !TakesAttendance
+      where Person != user && BookedBy != user && !BooksFor(this.Person) && !TeachesSession(this.Session);
+    // Every column is closed to a direct write; the kit's functions are the only way in.
+    allow create, update when IsAuthenticated;
+    deny create except via BookSession, WalkIn;
+    deny update State, Seat, Ticket, OfferedAt, OfferExpiresAt, CancelledAt, CheckedInAt except via Hold;
+    deny update LateCancel except via Hold, MarkLate;
+    deny update BookedBy except via BookSession, WalkIn;
+    allow delete when ManagesSessions;
+    deny delete except via ForgetBookingsOf;
+  }
+}
+
+// ── what the app hears ────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A place is confirmed — booked, accepted from an offer, promoted from the waiting list, or walked in.
+[Event("Booking confirmed")]
+public sealed class BookingConfirmed { public Booking Booking; }
+
+/// The session was full and the person joined its waiting list.
+[Event("Joined the waiting list")]
+public sealed class JoinedWaitlist { public Booking Booking; }
+
+/// A freed place is held for a person until `Booking.OfferExpiresAt` — tell them: `[On] void Tell(PlaceOffered e) { … }`.
+[Event("Place offered")]
+public sealed class PlaceOffered { public Booking Booking; }
+
+/// An offer ran out unanswered; the place passed on.
+[Event("Offer lapsed")]
+public sealed class OfferLapsed { public Booking Booking; }
+
+/// A booking, a place on the waiting list or an offer was given up (or the session was cancelled).
+[Event("Booking cancelled")]
+public sealed class BookingCancelled { public Booking Booking; }
+
+/// A confirmed booking was cancelled inside the free-cancellation window — what the app charges for, if it does.
+[Event("Late cancellation")]
+public sealed class LateCancellation { public Booking Booking; }
+
+/// The session was cancelled; every booking of it was cancelled first (each heard as BookingCancelled).
+[Event("Session cancelled")]
+public sealed class SessionCancelled { public BookableSession Session; }
+
+/// The session moved; everyone booked or waiting should be told. `From` is when it started before.
+[Event("Session moved")]
+public sealed class SessionMoved { public BookableSession Session; public DateTime From; }
+
+/// A booked person is reminded `RemindBefore` the start.
+[Event("Session reminder")]
+public sealed class SessionReminder { public Booking Booking; }
+
+/// The person arrived and was checked in.
+[Event("Checked in")]
+public sealed class CheckedIn { public Booking Booking; }
+
+/// The register closed and the person never came — what the app charges for, if it does.
+[Event("No-show")]
+public sealed class NoShow { public Booking Booking; }

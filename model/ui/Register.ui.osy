@@ -1,0 +1,135 @@
+// The register at the door: the sessions of the day, and for the one chosen, everyone booked — checked in with a tap,
+// marked absent once it has started — and a walk-in found by name or added on the spot.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Identity;
+using Osysharp.Ui;
+
+/// One session the register can open.
+public class RegisterSession {
+  public Guid Id;
+  public string Title = "";
+  public DateTime StartsAt;
+  public string With = "";
+  public int Booked;
+  public int Capacity;
+}
+
+/// Today's sessions (from an hour ago) whose register the caller may take, soonest first.
+public List<RegisterSession> RegistersToday() {
+  var from = DateTime.UtcNow.AddHours(-3);
+  var until = DateTime.UtcNow.Date.AddDays(1);
+  List<RegisterSession> found = [];
+  foreach (var s in BookableSession.Where(s => s.StartsAt >= from && s.StartsAt < until && !s.Cancelled).OrderBy(s => s.StartsAt).Take(100).ToList()) {
+    if (!MayTakeRegister(s)) { continue; }
+    found.Add(new RegisterSession {
+      Id = s.Id, Title = s.Title, StartsAt = s.StartsAt, With = HeldBy(s), Capacity = s.Capacity,
+      Booked = Booking.Count(b => b.Session == s && (b.State == BookingState.Booked || b.State == BookingState.Attended)),
+    });
+  }
+  return found;
+}
+
+/// The register. In a test: `Ui.Click("Tonight")` to open a session, `Ui.Click("Check in", within: "Ana")`,
+/// `Ui.Click("Absent", within: "Ben")`, `Ui.Fill("Walk-in", "Dee")`, `Ui.Press("Enter")`, `Ui.Click("Walk in", within: "Dee")`.
+[Composable]
+public component RegisterScreen() {
+  List<RegisterSession> sessions = [];
+  Guid open = Guid.Empty;
+  string openTitle = "";
+  List<RosterLine> roster = [];
+  string search = "";
+  List<Principal> found = [];
+  bool canAdd = false;
+  string notice = "";
+
+  on mount { sessions = RegistersToday(); if (sessions.Count > 0) { Open(sessions[0]); } }
+
+  action Open(RegisterSession s) { open = s.Id; openTitle = s.Title; notice = ""; found = []; search = ""; Load(); }
+  action Load() { roster = RegisterOf(BookableSession.Single(s => s.Id == open)); sessions = RegistersToday(); }
+  action Show(BookingOutcome o) { notice = o.Message; Load(); }
+  action Arrive(RosterLine l) { Show(CheckIn(Booking.Single(b => b.Id == l.BookingId))); }
+  action Undo(RosterLine l) {
+    try { UndoCheckIn(Booking.Single(b => b.Id == l.BookingId)); Load(); } catch (Exception ex) { notice = ex.Message; }
+  }
+  action Absent(RosterLine l) {
+    try { MarkNoShow(Booking.Single(b => b.Id == l.BookingId)); notice = l.Name + " is marked absent."; Load(); }
+    catch (Exception ex) { notice = ex.Message; }
+  }
+  action Find() {
+    found = FindWalkIns(search);
+    canAdd = search.Trim() != "";
+  }
+  action WalkInPerson(Principal p) {
+    Show(WalkIn(BookableSession.Single(s => s.Id == open), p));
+    found = []; search = "";
+  }
+  action AddWalkIn() {
+    try {
+      var p = NewWalkInPerson(search);
+      if (p == null) { notice = "Walk-ins are added from the people list here."; return; }
+      WalkInPerson(p!);
+    } catch (Exception ex) { notice = ex.Message; }
+  }
+
+  render {
+    Stack(gap: 6, maxW: "60rem", w: "100%", mx: "auto", px: 4, py: 6) {
+      PageHead("Register", subtitle: "Check people in as they arrive, walk in whoever turns up, and mark who never came.");
+      if (sessions.Count == 0) { EmptyState("No registers today", body: "Sessions you lead or run show here on the day."); }
+      Row(gap: 2, wrap: Wrapping.Wrap, label: "Today") {
+        foreach (var s in sessions) {
+          Button(s.StartsAt.ToString("HH:mm") + " " + s.Title, onPress: () => Open(s), size: Size.Sm,
+                 tone: s.Id == open ? Tone.Primary : Tone.Default, announceAs: s.Title);
+        }
+      }
+      if (open != Guid.Empty) {
+        Card(title: openTitle, subtitle: $"{roster.Count(r => r.State == BookingState.Attended)} of {roster.Count(r => r.State == BookingState.Booked || r.State == BookingState.Attended || r.State == BookingState.NoShow)} checked in") {
+          Stack(gap: 4) {
+            if (notice != "") { Alert(notice); }
+            Stack(gap: 0, role: UiRole.List, label: "Register for " + openTitle) {
+              foreach (var r in roster) {
+                Row(gap: 3, align: Align.Center, py: 2, borderBW: 1, border: Colors.Border, wrap: Wrapping.Wrap, role: UiRole.ListItem, label: r.Name) {
+                  Text(r.Seat != null ? $"{r.Seat}" : "–", color: Colors.TextMuted, minW: "2rem");
+                  Text(r.Name, fontWeight: FontWeight.Medium, grow: 1, minW: "0");
+                  if (r.State == BookingState.Attended) {
+                    Badge("Checked in " + (r.CheckedInAt == null ? "" : r.CheckedInAt.Value.ToString("HH:mm")), tone: Tone.Success);
+                    Button("Undo", onPress: () => Undo(r), tone: Tone.Ghost, size: Size.Sm, announceAs: "Undo the check-in of " + r.Name);
+                  } else if (r.State == BookingState.Booked) {
+                    Button("Absent", onPress: () => Absent(r), tone: Tone.Ghost, size: Size.Sm, announceAs: "Mark " + r.Name + " absent");
+                    Button("Check in", onPress: () => Arrive(r), tone: Tone.Primary, size: Size.Sm, announceAs: "Check in " + r.Name);
+                  } else if (r.State == BookingState.NoShow) {
+                    Badge("Absent", tone: Tone.Danger);
+                    Button("Check in", onPress: () => Arrive(r), tone: Tone.Default, size: Size.Sm, announceAs: "Check in " + r.Name);
+                  } else if (r.State == BookingState.Offered) {
+                    Badge("Place offered", tone: Tone.Warning);
+                  } else {
+                    Badge(r.Position != null ? $"Waiting · number {r.Position}" : "Waiting", tone: Tone.Default);
+                  }
+                }
+              }
+            }
+            Stack(gap: 2, label: "Walk-in") {
+              Row(gap: 2, align: Align.End) {
+                Box(grow: 1, minW: "0") { Field("Walk-in", value: search, placeholder: "A name or an address", onEnter: Find); }
+                Button("Find", onPress: Find, tone: Tone.Default);
+              }
+              foreach (var p in found) {
+                Row(gap: 2, align: Align.Center, label: p.DisplayName) {
+                  Text(p.DisplayName != "" ? p.DisplayName : p.Email, grow: 1, minW: "0");
+                  Button("Walk in", onPress: () => WalkInPerson(p), tone: Tone.Primary, size: Size.Sm, announceAs: "Walk in " + p.DisplayName);
+                }
+              }
+              if (canAdd && found.Count == 0) {
+                Row(gap: 2, align: Align.Center) {
+                  Text("Nobody by that name.", color: Colors.TextSecondary, grow: 1);
+                  Button("Add “" + search.Trim() + "” and walk them in", onPress: AddWalkIn, tone: Tone.Default, size: Size.Sm);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

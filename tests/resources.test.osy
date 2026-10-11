@@ -1,0 +1,84 @@
+// Instructors, rooms and equipment: what a session holds, and the rule that no two sessions hold one at once.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.ClassBookings;
+
+[Test(School)]
+void a_class_holds_its_chef_and_its_kitchen() {
+  runas (Omar) {
+    AssignResource(Cls("Pasta"), Res("Chef Sam"));
+    AssignResource(Cls("Pasta"), Res("Kitchen 1"));
+    AssignResource(Cls("Pasta"), Res("Kitchen 1"));                    // assigning again changes nothing
+    Assert.Equal(2, SessionAssignment.Count(a => a.Session.Id == Cls("Pasta").Id));
+    Assert.Equal("Chef Sam · Kitchen 1", HeldBy(Cls("Pasta")));
+    Assert.Equal(8, SmallestResourceCapacity(Cls("Pasta")));
+  }
+}
+
+[Test(School)]
+void a_busy_resource_is_refused_with_where_it_is() {
+  runas (Omar) {
+    AssignResource(Cls("Pasta"), Res("Chef Sam"));
+    var other = new CookingClass { Title = "Gnocchi", StartsAt = Cls("Pasta").StartsAt.AddHours(1), Capacity = 4 };
+    UnitOfWork.Commit();
+    var refused = Assert.Throws(() => AssignResource(Cls("Gnocchi"), Res("Chef Sam")));
+    Assert.Contains("Chef Sam is already in “Pasta”", refused.Message);
+    // Sushi starts as Pasta ends: back to back is not a clash.
+    AssignResource(Cls("Sushi"), Res("Chef Sam"));
+    Assert.Equal(1, SessionAssignment.Count(a => a.Session.Id == Cls("Sushi").Id));
+  }
+}
+
+[Test(School)]
+void a_cancelled_session_holds_nothing() {
+  runas (Omar) {
+    AssignResource(Cls("Pasta"), Res("Kitchen 1"));
+    CancelSession(Cls("Pasta"));
+    var other = new CookingClass { Title = "Risotto", StartsAt = Cls("Pasta").StartsAt, Capacity = 4 };
+    UnitOfWork.Commit();
+    AssignResource(Cls("Risotto"), Res("Kitchen 1"));
+  }
+}
+
+[Test(School)]
+void a_room_takes_no_more_people_than_it_holds() {
+  runas (Omar) {
+    Assert.Contains("takes 2 at most", Assert.Throws(() => AssignResource(Cls("Kids' bread"), Res("Kitchen 2"))).Message);
+    AssignResource(Cls("Pasta"), Res("Kitchen 2"));
+    Assert.Contains("hold 2 at most", Assert.Throws(() => SetCapacity(Cls("Pasta"), 3)).Message);
+  }
+}
+
+[Test(School)]
+void moving_a_class_checks_what_it_holds_and_the_school_hears_it() {
+  runas (Omar) {
+    AssignResource(Cls("Pasta"), Res("Chef Sam"));
+    AssignResource(Cls("Knife skills"), Res("Chef Sam"));
+    var refused = Assert.Throws(() => MoveSession(Cls("Pasta"), Cls("Knife skills").StartsAt));
+    Assert.Contains("Knife skills", refused.Message);
+    var from = Cls("Pasta").StartsAt;
+    MoveSession(Cls("Pasta"), from.AddDays(2));
+    Assert.Equal(from.AddDays(2), Cls("Pasta").StartsAt);
+    Assert.Equal(from.AddDays(2).AddHours(2), Cls("Pasta").EndsAt);
+  }
+  Assert.Equal(1, HeardCount("moved"));
+}
+
+[Test(School)]
+void nobody_assigns_a_resource_by_hand_and_only_the_desk_assigns_at_all() {
+  runas (Omar) { Assert.Denied(() => { Assign(Cls("Pasta"), Res("Chef Sam")); UnitOfWork.Commit(); }); }
+  runas (Sam) { Assert.Throws<NotAuthorized>(() => AssignResource(Cls("Pasta"), Res("Chef Sam"))); }
+}
+
+[Test(School)]
+void a_chef_lists_the_classes_he_teaches() {
+  runas (Omar) {
+    AssignResource(Cls("Pasta"), Res("Chef Sam"));
+    AssignResource(Cls("Knife skills"), Res("Chef Sam"));
+  }
+  runas (Sam) {
+    var mine = SessionsTaughtBy(Sam, DateTime.UtcNow);
+    Assert.Equal(2, mine.Count);
+    Assert.Equal("Pasta", mine[0].Title);
+  }
+}

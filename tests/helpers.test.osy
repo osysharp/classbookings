@@ -1,0 +1,24 @@
+// Helpers that move the clock or act as somebody — test-only constructs, so they live in a test file.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Workflow;
+using Osysharp.ClassBookings;
+
+/// Make an offer's timer fall due and let it fire: the clock moves, the run is settled — as the desk.
+void LetTheOfferRun(string title, string name, TimeSpan by) {
+  SeatOffer? offer = null;
+  runas (Omar) {
+    var session = Cls(title);
+    offer = OfferOf(Booking.Single(b => b.Session.Id == session.Id && b.Person.DisplayName == name));
+  }
+  TestClock.Advance(by);
+  runas (Omar) { Workflow.Settle(offer!); }
+  Background.Settle();
+}
+
+/// Let a session's own clock run to now, as the desk.
+void SettleClock(string title) {
+  runas (Omar) { Workflow.Settle(SessionClock.Single(c => c.Session.Id == Cls(title).Id)); }
+  Background.Settle();
+}
+

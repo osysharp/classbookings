@@ -1,0 +1,209 @@
+// The register: checking people in, walking them in, marking them absent — and each session's own clock, which reminds
+// the people booked before it starts and closes its register after it ends.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Identity;
+using Osysharp.Workflow;
+
+/// Check a booked person in. Whoever takes the register may, from when booking closes until the register closes; the
+/// person (or whoever books for them) may too when the app allows self check-in, from `CheckInOpensBefore` the start
+/// until it ends.
+[Server, Authorize(IsAuthenticated)]
+public BookingOutcome CheckIn(Booking booking) {
+  var session = booking.Session;
+  var setup = App.Setting<ClassBookingsSetup>();
+  var now = DateTime.UtcNow;
+  var staff = MayTakeRegister(session);
+  if (!staff) {
+    if (!setup.SelfCheckIn || !MayAnswerFor(booking)) { return Say(BookingResult.Refused, booking, "Check in at the desk."); }
+    if (now < session.StartsAt - setup.CheckInOpensBefore) {
+      return Say(BookingResult.Refused, booking, "Check-in opens " + WhenText(session.StartsAt - setup.CheckInOpensBefore) + ".");
+    }
+    if (now > EndOf(session)) { return Say(BookingResult.Refused, booking, "This session has ended."); }
+  }
+  if (session.RegisterClosedAt != null) { return Say(BookingResult.Refused, booking, "The register for this session has closed."); }
+  if (booking.State == BookingState.Attended) { return Say(BookingResult.NothingToDo, booking, "Already checked in."); }
+  if (booking.State != BookingState.Booked && booking.State != BookingState.NoShow) {
+    return Say(BookingResult.Refused, booking, "Only a confirmed booking can be checked in.");
+  }
+  Hold(booking, BookingState.Attended, booking.Seat, null, booking.OfferedAt, null);
+  UnitOfWork.Commit();
+  Raise(new CheckedIn { Booking = booking });
+  return Say(BookingResult.CheckedIn, booking, "Checked in.");
+}
+
+/// Take back a check-in made by mistake. Whoever takes the register, until it closes.
+[Server, Authorize(IsAuthenticated)]
+public void UndoCheckIn(Booking booking) {
+  if (!MayTakeRegister(booking.Session)) { throw new NotAuthorized("Only whoever takes the register can change it."); }
+  if (booking.Session.RegisterClosedAt != null) { throw new ValidationException("The register for this session has closed."); }
+  if (booking.State != BookingState.Attended) { return; }
+  Hold(booking, BookingState.Booked, booking.Seat, null, booking.OfferedAt, null);
+  UnitOfWork.Commit();
+}
+
+/// Mark a booked person absent once the session has started. The app hears `NoShow`.
+[Server, Authorize(IsAuthenticated)]
+public void MarkNoShow(Booking booking) {
+  if (!MayTakeRegister(booking.Session)) { throw new NotAuthorized("Only whoever takes the register can change it."); }
+  if (booking.Session.StartsAt > DateTime.UtcNow) { throw new ValidationException("Nobody is absent before the session starts."); }
+  if (booking.State != BookingState.Booked) { return; }
+  Hold(booking, BookingState.NoShow, booking.Seat, null, booking.OfferedAt, null);
+  UnitOfWork.Commit();
+  Raise(new NoShow { Booking = booking });
+}
+
+/// Somebody arrives at the door: book them into a free place and check them in, in one step — past the booking window and
+/// the app's booking rules (the person taking the register decides), never past the places. A person already booked is
+/// simply checked in.
+[Server, Authorize(IsAuthenticated)]
+public BookingOutcome WalkIn(BookableSession session, Principal person) {
+  if (!MayTakeRegister(session)) { return Say(BookingResult.Refused, null, "Only whoever takes the register can walk someone in."); }
+  if (session.Cancelled) { return Say(BookingResult.SessionCancelled, null, "This session has been cancelled."); }
+  if (session.RegisterClosedAt != null) { return Say(BookingResult.Refused, null, "The register for this session has closed."); }
+  var existing = Booking.FirstOrDefault(b => b.Session == session && b.Person == person);
+  if (existing != null && (existing.State == BookingState.Booked || existing.State == BookingState.NoShow)) { return CheckIn(existing); }
+  if (existing != null && existing.State == BookingState.Attended) { return Say(BookingResult.NothingToDo, existing, "Already checked in."); }
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var seat = LowestFreeSeat(session);
+    if (seat == null) { return Say(BookingResult.Refused, null, "The session is full."); }
+    try {
+      Booking booking;
+      if (existing != null) {
+        booking = existing;
+        if (existing.State == BookingState.Offered) { CloseOffer(existing); }
+        Hold(booking, BookingState.Attended, existing.Seat ?? seat, null, null, null);
+        booking.BookedBy = CurrentPrincipal();
+      } else {
+        booking = new Booking { Session = session, Person = person, BookedBy = CurrentPrincipal(), State = BookingState.Attended, Seat = seat,
+                                CheckedInAt = DateTime.UtcNow };
+      }
+      StartClock(session);
+      UnitOfWork.Commit();
+      Raise(new BookingConfirmed { Booking = booking });
+      Raise(new CheckedIn { Booking = booking });
+      return Say(BookingResult.CheckedIn, booking, "Walked in and checked in: place " + booking.Seat + ".");
+    } catch (ConflictException e) {
+      UnitOfWork.Discard();
+      existing = Booking.FirstOrDefault(b => b.Session == session && b.Person == person);
+    } catch (ValidationException e) {
+      UnitOfWork.Discard();
+      existing = Booking.FirstOrDefault(b => b.Session == session && b.Person == person);
+    }
+  }
+  return Say(BookingResult.Refused, null, "The register is busy. Please try again.");
+}
+
+/// Close a session's register: everyone still booked and not checked in is marked absent (the app hears `NoShow` for
+/// each), and the register changes no more. Its clock does this by itself after `CloseRegisterAfter`; whoever takes the
+/// register may close it sooner. Answers how many were marked absent.
+[Server, Authorize(IsAuthenticated)]
+[SuppressWarning("cost-unbounded-read")]   // the booked rows of ONE session: each is written
+public int CloseRegister(BookableSession session) {
+  if (!MayTakeRegister(session) && CurrentPrincipal() != null) { throw new NotAuthorized("Only whoever takes the register can close it."); }
+  if (session.RegisterClosedAt != null || session.Cancelled) { return 0; }
+  if (session.StartsAt > DateTime.UtcNow) { throw new ValidationException("A register closes once the session has started."); }
+  var absent = Booking.Where(b => b.Session == session && b.State == BookingState.Booked).ToList();
+  foreach (var b in absent) { Hold(b, BookingState.NoShow, b.Seat, null, b.OfferedAt, null); }
+  session.RegisterClosedAt = DateTime.UtcNow;
+  UnitOfWork.Commit();
+  foreach (var b in absent) { Raise(new NoShow { Booking = b }); }
+  return absent.Count;
+}
+
+/// Everyone on the register of `session` — booked, attended, absent, offered and waiting — in place order, then queue
+/// order. Whoever takes it sees the people; anybody else sees the places.
+public List<Booking> RosterOf(BookableSession session) {
+  return Booking.Where(b => b.Session == session && b.State != BookingState.Cancelled && b.State != BookingState.Lapsed)
+    .OrderBy(b => b.Seat ?? 100000).ThenBy(b => b.Ticket ?? 0).Take(1000).ToList();
+}
+
+// ── each session's clock ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// Where a session's clock stands. ⚠ Appended, never inserted.
+public enum ClockStage { Upcoming, Running, Closed }
+
+/// A session's clock — one per session, started by its first booking. Tracked by `SessionTimeline`.
+[Unique(Session, "That session already has a clock.")]
+public entity SessionClock {
+  [Required, Immutable] BookableSession Session;
+  ClockStage Stage;                                   // no default — SessionTimeline owns it
+  security {
+    // Readable by everyone who may book: the first booking of a session starts its clock, and every later one must see
+    // that it has one (a clock holds nothing about anybody).
+    allow read when IsAuthenticated;
+    allow create when IsAuthenticated;
+    deny create except via StartClock;
+  }
+}
+
+/// Start the session's clock if it has none. Internal: booking and walking in call it.
+[Server, Authorize(IsAuthenticated)]
+internal void StartClock(BookableSession session) {
+  if (SessionClock.Any(c => c.Session == session)) { return; }
+  new SessionClock { Session = session };
+}
+
+TimeSpan UntilReminder(BookableSession session) {
+  var wait = session.StartsAt - App.Setting<ClassBookingsSetup>().RemindBefore - DateTime.UtcNow;
+  return wait < TimeSpan.Zero ? TimeSpan.Zero : wait;
+}
+
+TimeSpan UntilRegisterCloses(BookableSession session) {
+  var wait = EndOf(session) + App.Setting<ClassBookingsSetup>().CloseRegisterAfter - DateTime.UtcNow;
+  return wait < TimeSpan.Zero ? TimeSpan.Zero : wait;
+}
+
+/// Remind everyone booked — once, by the clock.
+internal void SendReminders(BookableSession session) {
+  if (App.Setting<ClassBookingsSetup>().RemindBefore <= TimeSpan.Zero || session.Cancelled) { return; }
+  foreach (var b in Booking.Where(b => b.Session == session && b.State == BookingState.Booked).Take(1000).ToList()) {
+    Raise(new SessionReminder { Booking = b });
+  }
+}
+
+/// A session's day: the reminder before it, the register after it — and, whenever a place frees up, passing it to the
+/// people waiting. A moved session re-arms both (`MoveSession` raises
+/// `Recheck`); a cancelled one does neither.
+workflow SessionTimeline {
+  Tracks    = SessionClock.Stage;
+  Autostart = true;
+  Initial   = Upcoming;
+
+  event Recheck();
+  event Vacancy();
+
+  state Upcoming {
+    Expire { Within = UntilReminder(this.Item.Session); Accrues = false; }
+    subscribe Recheck();
+    subscribe Vacancy();
+    on Recheck { goto Upcoming; }
+    on Vacancy { Announce(FillVacancies(this.Item.Session)); goto Upcoming; }
+    on Expire {
+      if (this.Item.Session.Cancelled) { goto Closed; }
+      if (UntilReminder(this.Item.Session) > TimeSpan.FromMinutes(1)) { goto Upcoming; }   // moved later since it was armed
+      SendReminders(this.Item.Session);
+      goto Running;
+    }
+  }
+
+  state Running {
+    Expire { Within = UntilRegisterCloses(this.Item.Session); Accrues = false; }
+    subscribe Recheck();
+    subscribe Vacancy();
+    on Vacancy { Announce(FillVacancies(this.Item.Session)); goto Running; }
+    on Recheck {
+      if (UntilReminder(this.Item.Session) > TimeSpan.FromMinutes(1)) { goto Upcoming; }
+      goto Running;
+    }
+    on Expire {
+      if (this.Item.Session.Cancelled) { goto Closed; }
+      if (UntilRegisterCloses(this.Item.Session) > TimeSpan.FromMinutes(1)) { goto Running; }
+      CloseRegister(this.Item.Session);
+      goto Closed;
+    }
+  }
+
+  terminal success Closed { }
+}

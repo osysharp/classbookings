@@ -1,0 +1,150 @@
+// What a session holds while it runs: an instructor, a room, a lane, a piece of equipment — and the rule that no two
+// sessions hold one at the same time. Moving a session re-checks every one it holds.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Identity;
+
+/// What kind of resource it is. ⚠ Appended, never inserted.
+public enum ResourceKind {
+  [Label("Instructor")] Instructor,
+  [Label("Room")] Room,
+  [Label("Equipment")] Equipment,
+  [Label("Other")] Other,
+}
+
+/// Something a session holds while it runs. An instructor names their account (`Person`), so they see their own
+/// sessions and take their registers; a room or a piece of equipment may say how many people it takes (`Capacity`), and
+/// no session it holds may offer more places than that.
+[Unique(Name, "A resource with that name already exists.")]
+public entity SessionResource {
+  [Required, MaxLength(120)] string Name;
+  ResourceKind Kind = ResourceKind.Room;
+  /// The instructor's own account, when the resource is a person.
+  Principal? Person;
+  /// The most people it takes; empty when it does not limit a session (an instructor, usually).
+  [Min(1)] int? Capacity;
+  bool Active = true;
+  /// Bumped by every assignment and move, so two people assigning the same resource at once cannot both succeed.
+  [ConcurrencyCheck] int Holds = 0;
+
+  security {
+    allow read when IsAuthenticated;
+    allow create, update when ManagesSessions;
+    deny update Holds except via AssignResource, MoveSession;
+  }
+}
+
+/// A session holding a resource. Made only by `AssignResource`, which refuses a clash.
+[Unique(Session, Resource, "The session already holds that resource.")]
+public entity SessionAssignment {
+  [Required, Immutable] BookableSession Session;
+  [Required, Immutable] SessionResource Resource;
+
+  security {
+    allow read when IsAuthenticated;
+    allow create, delete when ManagesSessions;
+    deny create except via AssignResource;
+    deny delete except via ReleaseResource;
+  }
+}
+
+/// True when the signed-in person is an instructor `session` holds — they take its register and see who is booked.
+public policy TeachesSession(BookableSession session) =>
+  SessionAssignment.Any(a => a.Session == session && a.Resource.Person == user);
+
+/// May the caller take the register of `session`: `TakesAttendance`, or its own instructor?
+public bool MayTakeRegister(BookableSession session) { return TakesAttendance || TeachesSession(session); }
+
+/// The resources `session` holds.
+public List<SessionResource> ResourcesOf(BookableSession session) {
+  return SessionAssignment.Where(a => a.Session == session).OrderBy(a => a.Resource.Kind).ThenBy(a => a.Resource.Name)
+    .Select(a => a.Resource).Take(20).ToList();
+}
+
+/// "Sam Okoye · Kitchen 2" — what a timetable shows beside a session.
+public string HeldBy(BookableSession session) {
+  return string.Join(" · ", ResourcesOf(session).Select(r => r.Name));
+}
+
+/// The fewest people any resource `session` holds takes, or null when none limits it.
+public int? SmallestResourceCapacity(BookableSession session) {
+  int? least = null;
+  foreach (var r in ResourcesOf(session)) {
+    if (r.Capacity != null && (least == null || r.Capacity < least)) { least = r.Capacity; }
+  }
+  return least;
+}
+
+/// The other session `resource` is held by between `starts` and `ends`, or null when it is free then. Cancelled sessions
+/// hold nothing.
+public BookableSession? ClashFor(SessionResource resource, BookableSession session, DateTime starts, DateTime ends) {
+  var near = SessionAssignment.Where(a => a.Resource == resource && a.Session != session && !a.Session.Cancelled
+                                          && a.Session.StartsAt < ends && a.Session.StartsAt > starts - TimeSpan.FromDays(2))
+    .Select(a => a.Session).Take(50).ToList();
+  foreach (var other in near) {
+    if (other.StartsAt < ends && EndOf(other) > starts) { return other; }
+  }
+  return null;
+}
+
+string ClashSentence(SessionResource resource, BookableSession other) {
+  return resource.Name + " is already in “" + other.Title + "” from " + other.StartsAt.ToString("d MMMM HH:mm") + " to "
+       + EndOf(other).ToString("HH:mm") + " UTC.";
+}
+
+/// Have `session` hold `resource`. Refused with the sentence to show when the resource is in another session at that
+/// time, is retired, or takes fewer people than the session has places.
+[Server, Authorize(ManagesSessions)]
+public SessionAssignment AssignResource(BookableSession session, SessionResource resource) {
+  var existing = SessionAssignment.FirstOrDefault(a => a.Session == session && a.Resource == resource);
+  if (existing != null) { return existing; }
+  if (!resource.Active) { throw new ValidationException(resource.Name + " is no longer in use."); }
+  if (resource.Capacity != null && session.Capacity > resource.Capacity) {
+    throw new ValidationException($"{resource.Name} takes {resource.Capacity} at most, and the session has {session.Capacity} places.");
+  }
+  var clash = ClashFor(resource, session, session.StartsAt, EndOf(session));
+  if (clash != null) { throw new ValidationException(ClashSentence(resource, clash)); }
+  resource.Holds = resource.Holds + 1;
+  var assignment = new SessionAssignment { Session = session, Resource = resource };
+  UnitOfWork.Commit();
+  return assignment;
+}
+
+/// Let `session` give up `resource`.
+[Server, Authorize(ManagesSessions)]
+public void ReleaseResource(BookableSession session, SessionResource resource) {
+  var held = SessionAssignment.FirstOrDefault(a => a.Session == session && a.Resource == resource);
+  if (held == null) { return; }
+  held.Delete();
+  UnitOfWork.Commit();
+}
+
+/// Move a session — a one-off change to one meeting of a series, or a correction. Refused with the sentence to show when
+/// a resource it holds is busy at the new time; the app hears `SessionMoved` to tell everyone booked, and the session's
+/// reminders and register follow the new time.
+[Server, Authorize(ManagesSessions)]
+public void MoveSession(BookableSession session, DateTime startsAt, DateTime? endsAt = null) {
+  if (session.Cancelled) { throw new ValidationException("A cancelled session cannot be moved."); }
+  if (endsAt != null && endsAt <= startsAt) { throw new ValidationException("A session must end after it starts."); }
+  var length = EndOf(session) - session.StartsAt;
+  var newEnd = endsAt ?? startsAt + length;
+  foreach (var r in ResourcesOf(session)) {
+    var clash = ClashFor(r, session, startsAt, newEnd);
+    if (clash != null) { throw new ValidationException(ClashSentence(r, clash)); }
+    r.Holds = r.Holds + 1;
+  }
+  var from = session.StartsAt;
+  session.StartsAt = startsAt;
+  session.EndsAt = session.EndsAt == null && endsAt == null ? null : newEnd;
+  UnitOfWork.Commit();
+  var clock = SessionClock.FirstOrDefault(c => c.Session == session);
+  if (clock != null) { SessionTimeline.RaiseRecheck(clock); }
+  Raise(new SessionMoved { Session = session, From = from });
+}
+
+/// The sessions an instructor's account is held by, from `from` on, soonest first — what "my classes" lists.
+public List<BookableSession> SessionsTaughtBy(Principal instructor, DateTime from) {
+  return SessionAssignment.Where(a => a.Resource.Person == instructor && a.Session.StartsAt >= from && !a.Session.Cancelled)
+    .OrderBy(a => a.Session.StartsAt).Select(a => a.Session).Take(100).ToList();
+}

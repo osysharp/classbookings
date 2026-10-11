@@ -1,0 +1,103 @@
+// The pages, driven the way a member, a parent and the desk drive them. `osy test --pixels` photographs each (Ui.Shot).
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.ClassBookings;
+
+[Test(School)]
+void a_member_books_a_class_and_joins_a_waiting_list_on_the_timetable() {
+  runas (Ben) { BookSession(Cls("Sushi"), Ben); }
+  runas (Omar) { AssignResource(Cls("Pasta"), Res("Chef Sam")); AssignResource(Cls("Pasta"), Res("Kitchen 1")); }
+  Ui.Viewport(1280, 900);
+  Ui.SignInAs(Cy);
+  Ui.Visit("/timetable");
+  Assert.Visible("Chef Sam · Kitchen 1", within: "Pasta");
+  Assert.Visible("2 places left", within: "Pasta");
+  Assert.Visible("knife-skills certificate", within: "Knife skills");
+  Ui.Shot("timetable");
+  Ui.Click("Book", within: "Pasta");
+  Assert.Visible("Booked: place 1.");
+  Assert.Visible("Booked · place 1", within: "Pasta");
+  Ui.Click("Join the waiting list", within: "Sushi");
+  Assert.Visible("Waiting · number 1", within: "Sushi");
+}
+
+[Test(School)]
+void a_parent_books_for_her_son_by_choosing_him_first() {
+  Ui.Viewport(1280, 900);
+  Ui.SignInAs(Ana);
+  Ui.Visit("/timetable");
+  Ui.Click("Leo", within: "Booking for");
+  Ui.Click("Book", within: "Kids' bread");
+  Assert.Visible("Booked · place 1", within: "Kids' bread");
+  Ui.Shot("timetable-for-a-child");
+  Ui.Visit("/my-bookings");
+  Assert.Visible("For Leo", within: "Kids' bread");
+}
+
+[Test(School)]
+void an_offered_place_is_taken_on_my_bookings_and_a_late_cancellation_says_so() {
+  runas (Ana) { BookSession(Cls("Sushi"), Ana); }
+  runas (Ben) { BookSession(Cls("Sushi"), Ben); }
+  runas (Ana) { CancelBooking(Mine("Sushi", Ana)); }
+  runas (Ben) { BookSession(Cls("Pasta"), Ben); }
+  Ui.Viewport(1280, 900);
+  Ui.SignInAs(Ben);
+  Ui.Visit("/my-bookings");
+  Assert.Visible("A place is held until", within: "Sushi");
+  Ui.Shot("my-bookings-offer");
+  Ui.Click("Take the place", within: "Sushi");
+  Assert.Visible("Booked: place 1.");
+  TestClock.Advance(TimeSpan.FromDays(5) - TimeSpan.FromHours(2));
+  Ui.Visit("/my-bookings");
+  Ui.Click("Cancel", within: "Pasta");
+  Assert.Dialog("Cancel Pasta?");
+  Assert.Visible("counts as a late cancellation");
+  Ui.Shot("my-bookings-late-cancel");
+  Ui.Click("Cancel late");
+  Assert.Visible("Booking cancelled — late, inside the cancellation window.");
+}
+
+[Test(AtTheDoor)]
+void the_desk_takes_the_register_and_walks_somebody_in() {
+  Ui.Viewport(1280, 900);
+  Ui.SignInAs(Omar);
+  Ui.Visit("/register");
+  Ui.Click("Tonight");
+  Assert.Visible("0 of 2 checked in");
+  Ui.Click("Check in", within: "Ana");
+  Assert.Visible("1 of 2 checked in");
+  Ui.Fill("Walk-in", "Wren");
+  Ui.Press("Enter");
+  Assert.Visible("Nobody by that name.");
+  Ui.Shot("register");
+  Ui.Click("Add “Wren” and walk them in");
+  Assert.Visible("The session is full.");
+}
+
+[Test(AtTheDoor)]
+void the_chef_sees_his_own_register_and_a_member_sees_none() {
+  Ui.Viewport(1280, 900);
+  Ui.SignInAs(Sam);
+  Ui.Visit("/register");
+  Assert.Visible("Ana", within: "Register for Tonight");
+  Ui.SignInAs(Dee);
+  Ui.Visit("/register");
+  Assert.Visible("No registers today");
+  Assert.Hidden("Ana");
+}
+
+[Test(School)]
+void the_timetable_reads_on_a_phone_and_in_the_dark() {
+  runas (Omar) { AssignResource(Cls("Pasta"), Res("Chef Sam")); }
+  Ui.Viewport(390, 844);
+  Ui.SignInAs(Cy);
+  Ui.Visit("/timetable");
+  Assert.Visible("Pasta");
+  Assert.NoOverflow();
+  Ui.Shot("timetable-phone");
+  Ui.Viewport(1280, 900);
+  Ui.Theme("dark");
+  Ui.Visit("/timetable");
+  Assert.Visible("Pasta");
+  Ui.Shot("timetable-dark");
+}

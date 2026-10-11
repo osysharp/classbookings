@@ -1,0 +1,139 @@
+// The waiting list: first come, first served; a freed place offered for a limited time on a durable clock, or given at
+// once; an old timer never undoes a later answer.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Workflow;
+using Osysharp.ClassBookings;
+
+void FullSushiWithBenThenCyWaiting() {
+  runas (Ana) { BookSession(Cls("Sushi"), Ana); }
+  runas (Ben) { BookSession(Cls("Sushi"), Ben); }
+  runas (Cy) { BookSession(Cls("Sushi"), Cy); }
+}
+
+[Test(School)]
+void a_freed_place_is_held_for_the_first_in_line_who_takes_it() {
+  FullSushiWithBenThenCyWaiting();
+  var before = DateTime.UtcNow;
+  runas (Ana) { CancelBooking(Mine("Sushi", Ana)); }
+  runas (Ben) {
+    var mine = Mine("Sushi", Ben);
+    Assert.Equal(BookingState.Offered, mine.State);
+    Assert.Equal(1, mine.Seat);
+    Assert.True(mine.OfferExpiresAt >= before + TimeSpan.FromHours(2));
+    Assert.Equal(0, PlacesLeft(Cls("Sushi")));
+    Assert.Equal(BookingResult.Booked, AcceptOffer(mine).Result);
+  }
+  runas (Cy) { Assert.Equal(1, QueuePosition(Mine("Sushi", Cy))); }
+  Assert.Equal(1, HeardCount("offered"));
+}
+
+[Test(School)]
+void declining_passes_the_place_on_at_once() {
+  FullSushiWithBenThenCyWaiting();
+  runas (Ana) { CancelBooking(Mine("Sushi", Ana)); }
+  runas (Ben) { Assert.Equal(BookingResult.Cancelled, DeclineOffer(Mine("Sushi", Ben)).Result); }
+  runas (Cy) { Assert.Equal(BookingState.Offered, Mine("Sushi", Cy).State); }
+}
+
+[Test(School)]
+void an_unanswered_offer_lapses_after_its_window_and_passes_to_the_next() {
+  FullSushiWithBenThenCyWaiting();
+  runas (Ana) { CancelBooking(Mine("Sushi", Ana)); }
+  LetTheOfferRun("Sushi", "Ben", TimeSpan.FromMinutes(119));
+  runas (Ben) { Assert.Equal(BookingState.Offered, Mine("Sushi", Ben).State); }
+  LetTheOfferRun("Sushi", "Ben", TimeSpan.FromMinutes(2));
+  runas (Ben) { Assert.Equal(BookingState.Lapsed, Mine("Sushi", Ben).State); }
+  runas (Cy) { Assert.Equal(BookingState.Offered, Mine("Sushi", Cy).State); }
+  Assert.Equal(1, HeardCount("lapsed"));
+  Assert.Equal(2, HeardCount("offered"));
+}
+
+[Test(School)]
+void an_accepted_offer_is_never_lapsed_by_its_old_timer() {
+  FullSushiWithBenThenCyWaiting();
+  runas (Ana) { CancelBooking(Mine("Sushi", Ana)); }
+  SeatOffer? offer = null;
+  runas (Omar) { offer = OfferOf(Mine("Sushi", Ben)); }
+  runas (Ben) { AcceptOffer(Mine("Sushi", Ben)); }
+  TestClock.Advance(TimeSpan.FromHours(3));
+  runas (Omar) { Workflow.Settle(offer!); }
+  Background.Settle();
+  runas (Ben) { Assert.Equal(BookingState.Booked, Mine("Sushi", Ben).State); }
+  Assert.Equal(0, HeardCount("lapsed"));
+}
+
+[Test(School)]
+void an_answer_after_the_offer_ran_out_lapses_it_and_says_so() {
+  FullSushiWithBenThenCyWaiting();
+  runas (Ana) { CancelBooking(Mine("Sushi", Ana)); }
+  TestClock.Advance(TimeSpan.FromHours(3));
+  runas (Ben) {
+    var late = AcceptOffer(Mine("Sushi", Ben));
+    Assert.Equal(BookingResult.Lapsed, late.Result);
+    Assert.Contains("ran out", late.Message);
+  }
+  runas (Cy) { Assert.Equal(BookingState.Offered, Mine("Sushi", Cy).State); }
+}
+
+[Test(School)]
+void the_offer_window_comes_from_the_apps_setup() {
+  SchoolOfferWindow.Stub(() => TimeSpan.FromMinutes(30));
+  FullSushiWithBenThenCyWaiting();
+  runas (Ana) { CancelBooking(Mine("Sushi", Ana)); }
+  LetTheOfferRun("Sushi", "Ben", TimeSpan.FromMinutes(31));
+  runas (Ben) { Assert.Equal(BookingState.Lapsed, Mine("Sushi", Ben).State); }
+}
+
+[Test(School)]
+void an_offer_never_outlasts_the_session_starting() {
+  FullSushiWithBenThenCyWaiting();
+  TestClock.Advance(TimeSpan.FromDays(5) + TimeSpan.FromHours(2));   // the class starts in an hour
+  runas (Ana) { CancelBooking(Mine("Sushi", Ana), waive: false); }
+  runas (Omar) {
+    var held = Mine("Sushi", Ben);
+    Assert.Equal(BookingState.Offered, held.State);
+    Assert.True(held.OfferExpiresAt <= Cls("Sushi").StartsAt);
+  }
+}
+
+[Test(School)]
+void a_school_that_promotes_books_the_first_in_line_at_once() {
+  SchoolWaitlist.Stub(() => WaitlistMode.Promote);
+  FullSushiWithBenThenCyWaiting();
+  runas (Ana) { CancelBooking(Mine("Sushi", Ana)); }
+  runas (Ben) {
+    Assert.Equal(BookingState.Booked, Mine("Sushi", Ben).State);
+    Assert.Equal(1, Mine("Sushi", Ben).Seat);
+  }
+  Assert.Equal(0, HeardCount("offered"));
+  Assert.Equal(2, HeardCount("confirmed"));    // Ana's booking, Ben's promotion
+}
+
+[Test(School)]
+void a_freed_place_passes_over_someone_the_schools_rule_no_longer_lets_in() {
+  runas (Omar) { new KnifeCertificate { Person = Ana }; new KnifeCertificate { Person = Ben }; new KnifeCertificate { Person = Cy }; UnitOfWork.Commit(); }
+  runas (Omar) { SetCapacity(Cls("Knife skills"), 1); }
+  runas (Ana) { BookSession(Cls("Knife skills"), Ana); }
+  runas (Ben) { BookSession(Cls("Knife skills"), Ben); }
+  runas (Cy) { BookSession(Cls("Knife skills"), Cy); }
+  runas (Omar) { KnifeCertificate.Single(k => k.Person.Id == Ben.Id).Delete(); UnitOfWork.Commit(); }
+  runas (Ana) { CancelBooking(Mine("Knife skills", Ana)); }
+  runas (Omar) {
+    Assert.Equal(BookingState.Waiting, Mine("Knife skills", Ben).State);
+    Assert.Equal(BookingState.Offered, Mine("Knife skills", Cy).State);
+  }
+}
+
+[Test(School)]
+void the_queue_keeps_its_order_through_several_cancellations() {
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); }
+  runas (Ben) { BookSession(Cls("Pasta"), Ben); }
+  runas (Cy) { BookSession(Cls("Pasta"), Cy); }
+  runas (Dee) { BookSession(Cls("Pasta"), Dee); }
+  runas (Eli) { BookSession(Cls("Pasta"), Eli); }
+  runas (Dee) { Assert.Equal(2, QueuePosition(Mine("Pasta", Dee))); }
+  runas (Cy) { CancelBooking(Mine("Pasta", Cy)); }
+  runas (Dee) { Assert.Equal(1, QueuePosition(Mine("Pasta", Dee))); }
+  runas (Eli) { Assert.Equal(2, QueuePosition(Mine("Pasta", Eli))); }
+}

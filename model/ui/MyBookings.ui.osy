@@ -1,0 +1,92 @@
+// "My bookings": everything the person has booked or is waiting for — theirs and that of everyone they book for — with
+// an offered place to take, and a cancellation that says when it would be late.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Identity;
+using Osysharp.Ui;
+
+/// The person's bookings. In a test: `Assert.Visible("Booked · place 1", within: "Pasta")`, `Ui.Click("Take the place",
+/// within: "Sushi")`, `Ui.Click("Cancel", within: "Pasta")` then `Ui.Click("Cancel the booking")`.
+[Composable]
+public component MyBookingsScreen() {
+  List<BookingLine> lines = [];
+  bool withPast = false;
+  string notice = "";
+  Guid cancelling = Guid.Empty;
+  string cancellingTitle = "";
+  bool cancellingLate = false;
+
+  on mount { Load(); }
+  action Load() { lines = MyBookings(withPast); }
+  action TogglePast() { withPast = !withPast; Load(); }
+  action Show(BookingOutcome o) { notice = o.Message; Load(); }
+  action Take(BookingLine l) { Show(AcceptOffer(Booking.Single(b => b.Id == l.BookingId))); }
+  action Decline(BookingLine l) { Show(DeclineOffer(Booking.Single(b => b.Id == l.BookingId))); }
+  action AskCancel(BookingLine l) { cancelling = l.BookingId; cancellingTitle = l.Title; cancellingLate = l.LateIfCancelled; }
+  action StopCancel() { cancelling = Guid.Empty; }
+  action Cancel() {
+    var id = cancelling;
+    cancelling = Guid.Empty;
+    Show(CancelBooking(Booking.Single(b => b.Id == id)));
+  }
+
+  render {
+    Stack(gap: 6, maxW: "56rem", w: "100%", mx: "auto", px: 4, py: 6) {
+      PageHead("My bookings", subtitle: "Your places, the waiting lists you are on, and those of the people you book for.");
+      if (notice != "") { Alert(notice); }
+      var coming = lines.Where(l => !l.Past && (l.State == BookingState.Booked || l.State == BookingState.Offered || l.State == BookingState.Waiting)).ToList();
+      var earlier = lines.Where(l => l.Past || l.State == BookingState.Cancelled || l.State == BookingState.Attended || l.State == BookingState.NoShow).ToList();
+      Stack(gap: 0, role: UiRole.List, label: "Coming up") {
+        SectionLabel("Coming up");
+        if (coming.Count == 0) { EmptyState("Nothing booked", body: "Book a session on the timetable."); }
+        foreach (var l in coming) {
+          Row(gap: 4, align: Align.Center, py: 3, borderBW: 1, border: Colors.Border, wrap: Wrapping.Wrap, role: UiRole.ListItem, label: l.Title) {
+            Stack(gap: 0, minW: "7rem") {
+              Text(l.StartsAt.ToString("ddd d MMM"), fontWeight: FontWeight.Semibold);
+              Text(l.StartsAt.ToString("HH:mm"), fontSize: FontSize.Label, color: Colors.TextMuted);
+            }
+            Stack(gap: 1, grow: 1, minW: "0") {
+              Text(l.Title, fontWeight: FontWeight.Medium);
+              Text(l.With == "" ? "For " + l.Person : "For " + l.Person + " · " + l.With, fontSize: FontSize.Label, color: Colors.TextSecondary);
+            }
+            if (l.State == BookingState.Booked) {
+              Badge(l.Seat != null ? $"Booked · place {l.Seat}" : "Booked", tone: Tone.Success);
+              Button("Cancel", onPress: () => AskCancel(l), tone: Tone.Ghost, size: Size.Sm, announceAs: "Cancel " + l.Title);
+            } else if (l.State == BookingState.Offered) {
+              Badge(l.OfferUntil != null ? "A place is held until " + l.OfferUntil.Value.ToString("d MMM HH:mm") : "A place is held", tone: Tone.Warning);
+              Button("Decline", onPress: () => Decline(l), tone: Tone.Ghost, size: Size.Sm);
+              Button("Take the place", onPress: () => Take(l), tone: Tone.Primary, size: Size.Sm);
+            } else {
+              Badge(l.Position != null ? $"Waiting · number {l.Position}" : "Waiting", tone: Tone.Default);
+              Button("Leave the list", onPress: () => AskCancel(l), tone: Tone.Ghost, size: Size.Sm);
+            }
+          }
+        }
+      }
+      Row { Button(withPast ? "Hide the last month" : "Show the last month", onPress: TogglePast, tone: Tone.Ghost, size: Size.Sm); }
+      if (withPast && earlier.Count > 0) {
+        Stack(gap: 0, role: UiRole.List, label: "Earlier") {
+          SectionLabel("Earlier");
+          foreach (var l in earlier) {
+            Row(gap: 4, align: Align.Center, py: 2, borderBW: 1, border: Colors.Border, wrap: Wrapping.Wrap, role: UiRole.ListItem, label: l.Title) {
+              Text(l.StartsAt.ToString("ddd d MMM HH:mm"), color: Colors.TextMuted, minW: "9rem");
+              Text(l.Title + " — " + l.Person, grow: 1, minW: "0");
+              Badge(l.State.Label, tone: l.State == BookingState.Attended ? Tone.Success : (l.State == BookingState.NoShow ? Tone.Danger : Tone.Default));
+            }
+          }
+        }
+      }
+    }
+    if (cancelling != Guid.Empty) {
+      Dialog("Cancel " + cancellingTitle + "?", onDismiss: StopCancel,
+             subtitle: cancellingLate ? "This is inside the cancellation window, so it counts as a late cancellation."
+                                      : "Your place goes to the next person waiting.") {
+        Row(gap: 2, justify: Justify.End) {
+          Button("Keep it", onPress: StopCancel, tone: Tone.Ghost);
+          Button(cancellingLate ? "Cancel late" : "Cancel the booking", onPress: Cancel, tone: Tone.Danger);
+        }
+      }
+    }
+  }
+}

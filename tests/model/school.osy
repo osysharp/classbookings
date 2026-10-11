@@ -1,0 +1,95 @@
+// Everything the cookery school says to the kit: its roles and who runs what, its own kind of session, its booking rule,
+// who a parent books for and how the desk adds a walk-in, its settings — and what it heard.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Guardianship;
+using Osysharp.ClassBookings;
+
+[Role] enum AppRole { Authenticator, Member, Chef, Desk }
+
+policy IsDesk => RoleGrant.Any(g => g.Member == user && g.Role == AppRole.Desk);
+
+policy ManagesSessions => IsDesk;
+policy TakesAttendance => IsDesk;
+policy BooksFor(Principal person) => person == user || ActsForDependant(person);
+policy ManagesGuardianships => IsDesk;
+policy MakesManagedAccounts => IsAuthenticated;
+
+app.Accounts = new AccountsSetup { AppName = "Larder Cookery School", SignupRole = AppRole.Member };
+
+/// A class at the school: the kit's session with the school's own fields.
+entity CookingClass : BookableSession {
+  [MaxLength(60)] string Cuisine = "";
+  bool NeedsKnifeSkills = false;
+  security {
+    allow read when IsAuthenticated;
+    allow create, update when ManagesSessions;
+  }
+}
+
+/// Somebody who has passed the school's knife-skills session.
+entity KnifeCertificate {
+  [Required] Principal Person;
+  security { allow read when IsAuthenticated; allow create, delete when IsDesk; }
+}
+
+/// The school's own booking rule: a class that needs knife skills needs the certificate.
+class KnifeSkillsRule : IBookingRule {
+  public string? Refusal(BookableSession session, Principal person) {
+    var cls = CookingClass.FirstOrDefault(c => c.Id == session.Id);
+    if (cls == null || !cls.NeedsKnifeSkills) { return null; }
+    if (KnifeCertificate.Any(k => k.Person == person)) { return null; }
+    return "This class needs the knife-skills certificate first.";
+  }
+}
+
+/// A parent books for their children; the desk makes an account for a walk-in who has none.
+class SchoolPeople : SessionPeople {
+  public override List<Principal> BookableBy(Principal me) { return MeAndMyDependants(); }
+  public override Principal? NewWalkIn(string name) {
+    var made = MakeManagedAccount(name, false);
+    UnitOfWork.Commit();
+    return ManagedAccountRequest.Single(r => r.Id == made.Id).Account;
+  }
+}
+
+/// A series makes the school's own kind of class.
+class SchoolMaker : SessionMaker {
+  public override BookableSession New(string title, DateTime startsAt, DateTime endsAt, int capacity) {
+    return new CookingClass { Title = title, StartsAt = startsAt, EndsAt = endsAt, Capacity = capacity, Cuisine = "Course" };
+  }
+}
+
+// The settings are functions, so a test can stub one and see the kit follow it.
+TimeSpan SchoolOfferWindow() { return TimeSpan.FromHours(2); }
+WaitlistMode SchoolWaitlist() { return WaitlistMode.Offer; }
+TimeSpan SchoolOpensBefore() { return TimeSpan.Zero; }
+TimeSpan SchoolClosesBefore() { return TimeSpan.Zero; }
+TimeSpan SchoolCancelFreeUntil() { return TimeSpan.FromHours(12); }
+bool SchoolSelfCheckIn() { return false; }
+
+app.ClassBookings = new ClassBookingsSetup {
+  OfferWindow = SchoolOfferWindow(), Waitlist = SchoolWaitlist(), OpensBefore = SchoolOpensBefore(),
+  ClosesBefore = SchoolClosesBefore(), CancelFreeUntil = SchoolCancelFreeUntil(), SelfCheckIn = SchoolSelfCheckIn(),
+  RemindBefore = TimeSpan.FromHours(24), CloseRegisterAfter = TimeSpan.FromMinutes(30),
+  People = new SchoolPeople(), Maker = new SchoolMaker(),
+};
+
+/// What the school heard, one row per event.
+entity Heard {
+  [MaxLength(40)] string Kind;
+  Guid About;
+  security { allow read when IsAuthenticated || IsAnonymous; }
+}
+
+[On] void HearConfirmed(BookingConfirmed e) { new Heard { Kind = "confirmed", About = e.Booking.Id }; UnitOfWork.Commit(); }
+[On] void HearWaitlist(JoinedWaitlist e) { new Heard { Kind = "waitlist", About = e.Booking.Id }; UnitOfWork.Commit(); }
+[On] void HearOffered(PlaceOffered e) { new Heard { Kind = "offered", About = e.Booking.Id }; UnitOfWork.Commit(); }
+[On] void HearLapsed(OfferLapsed e) { new Heard { Kind = "lapsed", About = e.Booking.Id }; UnitOfWork.Commit(); }
+[On] void HearCancelled(BookingCancelled e) { new Heard { Kind = "cancelled", About = e.Booking.Id }; UnitOfWork.Commit(); }
+[On] void HearLate(LateCancellation e) { new Heard { Kind = "late", About = e.Booking.Id }; UnitOfWork.Commit(); }
+[On] void HearSessionCancelled(SessionCancelled e) { new Heard { Kind = "session-cancelled", About = e.Session.Id }; UnitOfWork.Commit(); }
+[On] void HearMoved(SessionMoved e) { new Heard { Kind = "moved", About = e.Session.Id }; UnitOfWork.Commit(); }
+[On] void HearReminder(SessionReminder e) { new Heard { Kind = "reminder", About = e.Booking.Id }; UnitOfWork.Commit(); }
+[On] void HearCheckedIn(CheckedIn e) { new Heard { Kind = "checked-in", About = e.Booking.Id }; UnitOfWork.Commit(); }
+[On] void HearNoShow(NoShow e) { new Heard { Kind = "no-show", About = e.Booking.Id }; UnitOfWork.Commit(); }

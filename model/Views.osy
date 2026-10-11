@@ -1,0 +1,150 @@
+// What the pages read: a session as one line of a timetable, from one person's side; a booking as a line of "my
+// bookings"; a person on a register. Each is read as the caller, so a line holds only what the caller may see.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Identity;
+
+/// One session, from the side of the person a page is showing it for.
+public class SessionLine {
+  public Guid Id;
+  public string Title = "";
+  public DateTime StartsAt;
+  public DateTime EndsAt;
+  public string With = "";
+  public int Capacity;
+  public int Left;
+  public int Waiting;
+  public bool Cancelled;
+  public bool Full;
+  public bool WaitlistOpen;
+  /// The person's booking, if they have a live one: Booked, Waiting, Offered, Attended — or "".
+  public string Mine = "";
+  public Guid? BookingId;
+  public int? Seat;
+  public int? Position;
+  public DateTime? OfferUntil;
+  /// Why they may not book it now ("" when they may).
+  public string Refusal = "";
+  /// Cancelling now would be late.
+  public bool LateIfCancelled;
+}
+
+/// Where `person` stands on `session`, and what the session looks like to them.
+public SessionLine LineFor(BookableSession session, Principal person) {
+  var left = PlacesLeft(session);
+  var line = new SessionLine {
+    Id = session.Id, Title = session.Title, StartsAt = session.StartsAt, EndsAt = EndOf(session), With = HeldBy(session),
+    Capacity = session.Capacity, Left = left, Waiting = WaitingCount(session), Cancelled = session.Cancelled,
+    Full = left == 0, WaitlistOpen = session.WaitlistOpen,
+  };
+  var mine = Booking.FirstOrDefault(b => b.Session == session && b.Person == person);
+  if (mine != null && mine.State != BookingState.Cancelled && mine.State != BookingState.Lapsed) {
+    line.Mine = mine.State.ToString();
+    line.BookingId = mine.Id;
+    line.Seat = mine.Seat;
+    line.Position = QueuePosition(mine);
+    line.OfferUntil = mine.OfferExpiresAt;
+    line.LateIfCancelled = CancellingIsLate(mine);
+  } else {
+    line.Refusal = WhyNotBook(session, person) ?? "";
+  }
+  return line;
+}
+
+/// The sessions starting in the `days` days from `from`, soonest first, as `person` sees them.
+public List<SessionLine> Timetable(DateTime from, int days, Principal person) {
+  var until = from.AddDays(days);
+  List<SessionLine> lines = [];
+  foreach (var s in BookableSession.Where(s => s.StartsAt >= from && s.StartsAt < until).OrderBy(s => s.StartsAt).Take(300).ToList()) {
+    lines.Add(LineFor(s, person));
+  }
+  return lines;
+}
+
+/// One booking on a "my bookings" page.
+public class BookingLine {
+  public Guid BookingId;
+  public Guid SessionId;
+  public string Person = "";
+  public string Title = "";
+  public DateTime StartsAt;
+  public string With = "";
+  public BookingState State;
+  public int? Seat;
+  public int? Position;
+  public DateTime? OfferUntil;
+  public bool LateIfCancelled;
+  public bool Past;
+}
+
+/// The live and coming bookings of the caller and of everyone the caller books for, soonest first — then the last
+/// month's, most recent first, when `withPast`.
+public List<BookingLine> MyBookings(bool withPast = false) {
+  var me = CurrentPrincipal();
+  var now = DateTime.UtcNow;
+  var since = withPast ? now.AddDays(-31) : now.AddHours(-12);
+  List<Guid> people = [];
+  foreach (var p in App.Setting<ClassBookingsSetup>().People.BookableBy(me)) { people.Add(p.Id); }
+  if (!people.Contains(me.Id)) { people.Add(me.Id); }
+  var rows = Booking.Where(b => people.Contains(b.Person.Id) && b.Session.StartsAt >= since && b.State != BookingState.Lapsed)
+    .OrderBy(b => b.Session.StartsAt).Take(300).ToList();
+  List<BookingLine> lines = [];
+  foreach (var b in rows) {
+    lines.Add(new BookingLine {
+      BookingId = b.Id, SessionId = b.Session.Id, Person = b.Person.DisplayName != "" ? b.Person.DisplayName : b.Person.Email,
+      Title = b.Session.Title, StartsAt = b.Session.StartsAt, With = HeldBy(b.Session), State = b.State, Seat = b.Seat,
+      Position = QueuePosition(b), OfferUntil = b.OfferExpiresAt, LateIfCancelled = CancellingIsLate(b), Past = b.Session.StartsAt < now,
+    });
+  }
+  return lines;
+}
+
+/// One person on a register.
+public class RosterLine {
+  public Guid BookingId;
+  public string Name = "";
+  public BookingState State;
+  public int? Seat;
+  public int? Position;
+  public DateTime? CheckedInAt;
+}
+
+/// The register of `session` as lines — the people, for whoever takes it.
+public List<RosterLine> RegisterOf(BookableSession session) {
+  List<RosterLine> lines = [];
+  foreach (var b in RosterOf(session)) {
+    var name = b.Person == null ? "A booked place" : (b.Person.DisplayName != "" ? b.Person.DisplayName : b.Person.Email);
+    lines.Add(new RosterLine { BookingId = b.Id, Name = name, State = b.State, Seat = b.Seat, Position = QueuePosition(b), CheckedInAt = b.CheckedInAt });
+  }
+  return lines;
+}
+
+/// The people the caller may book for, themself first (the app's `ClassBookingsSetup.People`).
+[Server]
+public List<Principal> PeopleIBookFor() {
+  var me = CurrentPrincipal();
+  var people = App.Setting<ClassBookingsSetup>().People.BookableBy(me);
+  return people.Count == 0 ? [me] : people;
+}
+
+/// Does the caller take any register — the desk, or an instructor of some session?
+bool TakesAnyRegister() {
+  var me = CurrentPrincipal();
+  return TakesAttendance || SessionAssignment.Any(a => a.Resource.Person == me);
+}
+
+/// People the register finds for a walk-in by `text` — for whoever takes registers, and nobody else.
+[Server]
+public List<Principal> FindWalkIns(string text) {
+  if (!TakesAnyRegister()) { return []; }
+  return App.Setting<ClassBookingsSetup>().People.Find(text);
+}
+
+/// A person for a walk-in who has no account (the app's `NewWalkIn`), or null when the app adds none.
+[Server]
+public Principal? NewWalkInPerson(string name) {
+  if (!TakesAnyRegister()) { throw new NotAuthorized("Only whoever takes the register adds a walk-in."); }
+  if (name.Trim() == "") { throw new ValidationException("Give the walk-in's name."); }
+  return App.Setting<ClassBookingsSetup>().People.NewWalkIn(name.Trim());
+}

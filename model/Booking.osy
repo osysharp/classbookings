@@ -1,0 +1,415 @@
+// Booking, cancelling, the waiting list and its offers, and managing a session's places.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Identity;
+using Osysharp.Workflow;
+
+// ── the writer every other function goes through ──────────────────────────────────────────────────────────────────
+// The data refuses a direct write to a booking's state, place, queue number, offer and attendance times
+// (`deny update … except via Hold`). The public functions below decide who may do what; this makes the write.
+
+/// Move a booking to a state and set everything that goes with it, in one place. Internal: only the kit's functions call
+/// it, each after checking the caller.
+[Server, Authorize(IsAuthenticated)]
+internal void Hold(Booking booking, BookingState state, int? seat, int? ticket, DateTime? offeredAt, DateTime? offerExpiresAt) {
+  booking.State = state;
+  booking.Seat = seat;
+  booking.Ticket = ticket;
+  booking.OfferedAt = offeredAt;
+  booking.OfferExpiresAt = offerExpiresAt;
+  if (state == BookingState.Cancelled) { booking.CancelledAt = DateTime.UtcNow; }
+  if (state == BookingState.Booked || state == BookingState.Waiting) { booking.CancelledAt = null; booking.LateCancel = false; booking.CheckedInAt = null; }
+  if (state == BookingState.Attended) { booking.CheckedInAt = DateTime.UtcNow; }
+}
+
+/// Mark the cancellation of a confirmed booking as late. Internal, like `Hold`.
+[Server, Authorize(IsAuthenticated)]
+internal void MarkLate(Booking booking) {
+  booking.LateCancel = true;
+}
+
+/// Start the timer of an offered place.
+[Server, Authorize(IsAuthenticated)]
+internal SeatOffer OpenOffer(Booking booking, TimeSpan window) {
+  return new SeatOffer { Booking = booking, Window = window };
+}
+
+/// An offered place with its timer: one row per offer, tracked by `OfferLife`, which lapses it after `Window`.
+public enum OfferStatus { Open, Answered, Lapsed }
+
+public entity SeatOffer {
+  [Required, Immutable] Booking Booking;
+  [Immutable] TimeSpan Window;
+  [Immutable] DateTime IssuedAt = DateTime.UtcNow;
+  OfferStatus Status;                                 // no default — OfferLife owns it
+
+  security {
+    allow read when ManagesSessions;
+    allow create when IsAuthenticated;
+    deny create except via OpenOffer;
+    allow delete when ManagesSessions;
+    deny delete except via ForgetBookingsOf;
+  }
+}
+
+// ── reading ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+bool Live(Booking b) {
+  return b.State == BookingState.Booked || b.State == BookingState.Waiting || b.State == BookingState.Offered;
+}
+
+/// When `session` ends — its end, or an hour after it starts when it has none.
+public DateTime EndOf(BookableSession session) { return session.EndsAt ?? session.StartsAt + TimeSpan.FromHours(1); }
+
+/// The lowest numbered place of the session nobody holds, or null when every place is held.
+int? LowestFreeSeat(BookableSession session) {
+  var held = Booking.Where(b => b.Session == session && b.Seat != null).Select(b => b.Seat ?? 0).Take(session.Capacity + 1).ToList();
+  for (var seat = 1; seat <= session.Capacity; seat++) {
+    if (!held.Contains(seat)) { return seat; }
+  }
+  return null;
+}
+
+int NextTicket(BookableSession session) {
+  var top = Booking.Where(b => b.Session == session).Max(b => b.Ticket);
+  return (top ?? 0) + 1;
+}
+
+/// How many places of the session are free right now (0 for a cancelled session).
+public int PlacesLeft(BookableSession session) {
+  if (session.Cancelled) { return 0; }
+  var held = Booking.Count(b => b.Session == session && b.Seat != null);
+  return Math.Max(0, session.Capacity - held);
+}
+
+/// How many people are waiting for a place in the session.
+public int WaitingCount(BookableSession session) {
+  return Booking.Count(b => b.Session == session && b.State == BookingState.Waiting);
+}
+
+/// Where a waiting booking stands in the queue (1 = next to be offered a place); null when it is not waiting.
+public int? QueuePosition(Booking booking) {
+  if (booking.State != BookingState.Waiting || booking.Ticket == null) { return null; }
+  var ahead = Booking.Count(b => b.Session == booking.Session && b.State == BookingState.Waiting && b.Ticket < booking.Ticket);
+  return ahead + 1;
+}
+
+/// The open offer behind an offered booking, if any.
+public SeatOffer? OfferOf(Booking booking) {
+  return SeatOffer.FirstOrDefault(o => o.Booking == booking && o.Status == OfferStatus.Open);
+}
+
+/// May the caller act on `booking`: the person, whoever booked it or acts for them, or whoever runs sessions?
+public bool MayAnswerFor(Booking booking) {
+  var me = CurrentPrincipal();
+  var person = booking.Person;
+  if (person == null || me == null) { return false; }       // not theirs to see, so not theirs to answer
+  return person.Id == me.Id || (booking.BookedBy != null && booking.BookedBy.Id == me.Id) || BooksFor(person) || ManagesSessions;
+}
+
+BookingOutcome Say(BookingResult result, Booking? booking, string message) {
+  return new BookingOutcome { Result = result, Booking = booking, Message = message };
+}
+
+string WhenText(DateTime at) { return at.ToString("d MMMM HH:mm") + " UTC"; }
+
+/// Why `person` may not book `session` now (everything but whether there is room), or null when they may: cancelled,
+/// started, not open yet, closed, or an app rule.
+public string? WhyNotBook(BookableSession session, Principal person) {
+  if (session.Cancelled) { return "This session has been cancelled."; }
+  var setup = App.Setting<ClassBookingsSetup>();
+  var now = DateTime.UtcNow;
+  if (session.StartsAt <= now) { return "This session has already started."; }
+  if (setup.ClosesBefore > TimeSpan.Zero && session.StartsAt - setup.ClosesBefore <= now) { return "Booking for this session has closed."; }
+  if (setup.OpensBefore > TimeSpan.Zero && session.StartsAt - setup.OpensBefore > now) {
+    return "Booking opens on " + WhenText(session.StartsAt - setup.OpensBefore) + ".";
+  }
+  foreach (var rule in App.Implementations<IBookingRule>()) {
+    var refusal = rule.Refusal(session, person);
+    if (refusal != null) { return refusal; }
+  }
+  return null;
+}
+
+// ── passing a free place to the people waiting ────────────────────────────────────────────────────────────────────
+
+/// Offer (or, in `Promote` mode, give) every free place of the session to the next people in the queue whom the app's
+/// rules still allow, one commit each. Returns the bookings it moved, so the caller announces them once everything is
+/// stored. Safe to call at any time: with nothing free or nobody waiting it does nothing.
+List<Booking> FillVacancies(BookableSession session) {
+  var moved = new List<Booking>();
+  var setup = App.Setting<ClassBookingsSetup>();
+  var latest = session.StartsAt - setup.ClosesBefore;
+  if (session.Cancelled || latest <= DateTime.UtcNow) { return moved; }
+  var passedOver = new List<Guid>();
+  var stuck = 0;
+  while (stuck < 3) {
+    var seat = LowestFreeSeat(session);
+    if (seat == null) { break; }
+    var next = Booking.Where(b => b.Session == session && b.State == BookingState.Waiting && !passedOver.Contains(b.Id))
+      .OrderBy(b => b.Ticket).FirstOrDefault();
+    if (next == null) { break; }
+    if (WhyNotBook(session, next.Person) != null) { passedOver.Add(next.Id); continue; }
+    try {
+      var now = DateTime.UtcNow;
+      if (setup.Waitlist == WaitlistMode.Promote) {
+        Hold(next, BookingState.Booked, seat, null, null, null);
+      } else {
+        var until = now + setup.OfferWindow;
+        if (until > latest) { until = latest; }
+        Hold(next, BookingState.Offered, seat, next.Ticket, now, until);
+        OpenOffer(next, until - now);
+      }
+      UnitOfWork.Commit();
+      moved.Add(next);
+    } catch (ConflictException e) {
+      UnitOfWork.Discard();      // somebody else moved this booking or took this place first: look again
+      stuck++;
+    } catch (ValidationException e) {
+      UnitOfWork.Discard();
+      stuck++;
+    }
+  }
+  return moved;
+}
+
+/// Hand the freed places of `session` to the people waiting — on the session's own clock, which runs as the system:
+/// whoever freed a place (a member cancelling) may not see who is waiting, and the app's rules are asked about each of
+/// them as they are, not as the canceller sees them.
+void PassOn(BookableSession session) {
+  StartClock(session);
+  UnitOfWork.Commit();
+  var clock = SessionClock.Single(c => c.Session == session);
+  if (clock.Stage != ClockStage.Closed) { SessionTimeline.RaiseVacancy(clock); }
+}
+
+void Announce(List<Booking> moved) {
+  foreach (var b in moved) {
+    if (b.State == BookingState.Booked) { Raise(new BookingConfirmed { Booking = b }); }
+    else { Raise(new PlaceOffered { Booking = b }); }
+  }
+}
+
+/// Stop the timer of an offered booking: it was answered, or the session went away.
+void CloseOffer(Booking booking) {
+  var offer = SeatOffer.FirstOrDefault(o => o.Booking == booking && o.Status == OfferStatus.Open);
+  if (offer != null) { OfferLife.RaiseWithdraw(offer); }
+}
+
+// ── booking ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Book `person` into the session — the caller, or somebody the caller books for (`BooksFor`). A free place goes to them
+/// at once (the lowest free number); a full session puts them at the back of its waiting list, or refuses when it has
+/// none. Cancelled, started, not-yet-open and closed sessions refuse, and so does any `IBookingRule`.
+[Server, Authorize(BooksSessions)]
+public BookingOutcome BookSession(BookableSession session, Principal person) {
+  var me = CurrentPrincipal();
+  if (person.Id != me.Id && !BooksFor(person)) {
+    return Say(BookingResult.Refused, null, "You can only book for yourself or for someone you act for.");
+  }
+  for (var attempt = 0; attempt < 4; attempt++) {
+    if (session.Cancelled) { return Say(BookingResult.SessionCancelled, null, "This session has been cancelled."); }
+    if (session.StartsAt <= DateTime.UtcNow) { return Say(BookingResult.Closed, null, "This session has already started."); }
+
+    var existing = Booking.FirstOrDefault(b => b.Session == session && b.Person == person);
+    if (existing != null && existing.State == BookingState.Booked) {
+      return Say(BookingResult.AlreadyBooked, existing, "Already booked: place " + existing.Seat + ".");
+    }
+    if (existing != null && existing.State == BookingState.Waiting) {
+      return Say(BookingResult.AlreadyBooked, existing, "Already on the waiting list at number " + QueuePosition(existing) + ".");
+    }
+    if (existing != null && existing.State == BookingState.Offered) {
+      return Say(BookingResult.AlreadyBooked, existing, "A place is being held for this booking: take it before it passes on.");
+    }
+
+    var why = WhyNotBook(session, person);
+    if (why != null) {
+      return Say(why.StartsWith("Booking for this session has closed") ? BookingResult.Closed : BookingResult.Refused, null, why);
+    }
+
+    var seat = LowestFreeSeat(session);
+    if (seat == null && !session.WaitlistOpen) {
+      return Say(BookingResult.Refused, null, "This session is full and has no waiting list.");
+    }
+    var state = seat != null ? BookingState.Booked : BookingState.Waiting;
+    int? ticket = seat != null ? null : NextTicket(session);
+
+    try {
+      Booking booking;
+      if (existing != null) {
+        booking = existing;
+        Hold(booking, state, seat, ticket, null, null);
+        booking.BookedBy = me;
+      } else {
+        booking = new Booking { Session = session, Person = person, BookedBy = me, State = state, Seat = seat, Ticket = ticket };
+      }
+      StartClock(session);
+      UnitOfWork.Commit();
+      if (state == BookingState.Booked) {
+        Raise(new BookingConfirmed { Booking = booking });
+        return Say(BookingResult.Booked, booking, "Booked: place " + seat + ".");
+      }
+      Raise(new JoinedWaitlist { Booking = booking });
+      return Say(BookingResult.Waitlisted, booking, "The session is full. You are number " + QueuePosition(booking) + " on the waiting list.");
+    } catch (ConflictException e) {
+      UnitOfWork.Discard();      // somebody took the place or the queue number first: look again
+    } catch (ValidationException e) {
+      UnitOfWork.Discard();
+    }
+  }
+  return Say(BookingResult.Refused, null, "Too many people are booking at once. Please try again.");
+}
+
+/// Would cancelling `booking` now be late — a confirmed place given up inside the free-cancellation window?
+public bool CancellingIsLate(Booking booking) {
+  var window = App.Setting<ClassBookingsSetup>().CancelFreeUntil;
+  return booking.State == BookingState.Booked && window > TimeSpan.Zero && DateTime.UtcNow > booking.Session.StartsAt - window;
+}
+
+/// Give up a booking, a place on the waiting list or an offered place. A freed place goes to the first person waiting.
+/// Giving up a confirmed place inside the free-cancellation window is LATE: it is recorded and the app hears
+/// `LateCancellation` — unless whoever runs sessions cancels it with `waive`. Once the session has started only they can.
+[Server]
+public BookingOutcome CancelBooking(Booking booking, bool waive = false) {
+  if (!MayAnswerFor(booking)) { return Say(BookingResult.Refused, booking, "This is not your booking."); }
+  if (!Live(booking)) { return Say(BookingResult.NothingToDo, booking, "This booking is already cancelled."); }
+  if (booking.Session.StartsAt <= DateTime.UtcNow && !ManagesSessions) {
+    return Say(BookingResult.Refused, booking, "This session has started. Ask the desk.");
+  }
+  var hadPlace = booking.Seat != null;
+  var late = CancellingIsLate(booking) && !(waive && ManagesSessions);
+  CloseOffer(booking);
+  Hold(booking, BookingState.Cancelled, null, null, booking.OfferedAt, null);
+  if (late) { MarkLate(booking); }
+  UnitOfWork.Commit();
+  Raise(new BookingCancelled { Booking = booking });
+  if (late) { Raise(new LateCancellation { Booking = booking }); }
+  if (hadPlace) { PassOn(booking.Session); }
+  return Say(BookingResult.Cancelled, booking, late ? "Booking cancelled — late, inside the cancellation window." : "Booking cancelled.");
+}
+
+/// Take the place offered to a waiting person. If the offer ran out first the place has passed on and the booking
+/// lapses — the message says so.
+[Server]
+public BookingOutcome AcceptOffer(Booking booking) {
+  if (!MayAnswerFor(booking)) { return Say(BookingResult.Refused, booking, "This is not your booking."); }
+  if (booking.State != BookingState.Offered) { return Say(BookingResult.NothingToDo, booking, "There is no offered place to take."); }
+  if (booking.OfferExpiresAt != null && DateTime.UtcNow >= booking.OfferExpiresAt) {
+    var lapsed = LapseOffer(booking, true);
+    return Say(BookingResult.Lapsed, booking, "Sorry, the offer ran out at " + WhenText(lapsed.OfferExpiresAt ?? DateTime.UtcNow)
+                                               + " and the place has passed on. You can join the waiting list again.");
+  }
+  CloseOffer(booking);
+  Hold(booking, BookingState.Booked, booking.Seat, null, booking.OfferedAt, null);
+  UnitOfWork.Commit();
+  Raise(new BookingConfirmed { Booking = booking });
+  return Say(BookingResult.Booked, booking, "Booked: place " + booking.Seat + ".");
+}
+
+/// Turn an offered place down: it passes to the next person in line at once.
+[Server]
+public BookingOutcome DeclineOffer(Booking booking) {
+  if (!MayAnswerFor(booking)) { return Say(BookingResult.Refused, booking, "This is not your booking."); }
+  if (booking.State != BookingState.Offered) { return Say(BookingResult.NothingToDo, booking, "There is no offered place to decline."); }
+  CloseOffer(booking);
+  Hold(booking, BookingState.Cancelled, null, null, booking.OfferedAt, null);
+  UnitOfWork.Commit();
+  Raise(new BookingCancelled { Booking = booking });
+  PassOn(booking.Session);
+  return Say(BookingResult.Cancelled, booking, "Offer declined; the place passes to the next person.");
+}
+
+/// An offer ran out unanswered: free its place, mark the booking lapsed and offer the place to the next person waiting.
+/// Called by the offer's timer, and by an answer that arrives too late. Does nothing to a booking no longer offered.
+internal Booking LapseOffer(Booking booking, bool stopTimer) {
+  if (booking.State != BookingState.Offered) { return booking; }
+  if (stopTimer) { CloseOffer(booking); }
+  var expired = booking.OfferExpiresAt;
+  Hold(booking, BookingState.Lapsed, null, null, booking.OfferedAt, expired);
+  UnitOfWork.Commit();
+  Raise(new OfferLapsed { Booking = booking });
+  PassOn(booking.Session);
+  return booking;
+}
+
+/// The timer behind an offered place. It starts with the offer and ends either answered (taken, declined, or the session
+/// cancelled) or lapsed: after the window the booking lapses and the place passes on. An offer already answered has no
+/// timer left, so an old timer can never undo a later answer.
+workflow OfferLife {
+  Tracks    = SeatOffer.Status;
+  Autostart = true;
+  Initial   = Open;
+
+  event Withdraw();
+
+  state Open {
+    Expire { Within = this.Item.Window; Accrues = false; }
+    subscribe Withdraw();
+    on Withdraw { goto Answered; }
+    on Expire {
+      // An offer made since (declined, joined again and offered again) has its own timer: this one lapses nothing.
+      var newer = SeatOffer.Any(o => o.Booking == this.Item.Booking && o.IssuedAt > this.Item.IssuedAt);
+      if (!newer) { LapseOffer(this.Item.Booking, false); }
+      goto Lapsed;
+    }
+  }
+  terminal success Answered { }
+  terminal success Lapsed { }
+}
+
+// ── managing sessions ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Cancel a session: every live booking is cancelled (heard as BookingCancelled, never as late), then the session itself
+/// (SessionCancelled). Answers how many bookings were cancelled; 0 when it was cancelled already.
+[Server, Authorize(ManagesSessions)]
+[SuppressWarning("cost-unbounded-read")]   // every live booking of ONE session: that is the whole job, and each is written
+public int CancelSession(BookableSession session) {
+  if (session.Cancelled) { return 0; }
+  var live = Booking.Where(b => b.Session == session && (b.State == BookingState.Booked || b.State == BookingState.Waiting || b.State == BookingState.Offered)).ToList();
+  foreach (var b in live) {
+    CloseOffer(b);
+    Hold(b, BookingState.Cancelled, null, null, b.OfferedAt, null);
+  }
+  session.Cancelled = true;
+  UnitOfWork.Commit();
+  foreach (var b in live) { Raise(new BookingCancelled { Booking = b }); }
+  Raise(new SessionCancelled { Session = session });
+  return live.Count;
+}
+
+/// Change how many places a session has. Refused with the sentence to show when a held place would no longer exist, or
+/// the session's room holds fewer; more places go to the people waiting at once.
+[Server, Authorize(ManagesSessions)]
+public void SetCapacity(BookableSession session, int capacity) {
+  if (capacity < 0) { throw new ValidationException("A session cannot have fewer than no places."); }
+  var highest = Booking.Where(b => b.Session == session && b.Seat != null).Max(b => b.Seat);
+  if (highest != null && highest > capacity) {
+    throw new ValidationException($"Place {highest} is held — the session cannot go below {highest} places.");
+  }
+  var tooSmall = SmallestResourceCapacity(session);
+  if (tooSmall != null && capacity > tooSmall) {
+    throw new ValidationException($"The session's resources hold {tooSmall} at most.");
+  }
+  session.Capacity = capacity;
+  UnitOfWork.Commit();
+  PassOn(session);
+}
+
+/// Forget a person: every booking they hold or held goes — for an erasure request, or someone who left. Freed places
+/// go to the people waiting. Answers how many bookings went.
+[Server, Authorize(ManagesSessions)]
+[SuppressWarning("cost-unbounded-read")]   // one person's bookings, each deleted
+public int ForgetBookingsOf(Principal person) {
+  var mine = Booking.Where(b => b.Person.Id == person.Id).ToList();
+  List<BookableSession> freed = [];
+  foreach (var b in mine) {
+    if (b.Seat != null && b.Session.StartsAt > DateTime.UtcNow && !freed.Any(s => s.Id == b.Session.Id)) { freed.Add(b.Session); }
+    CloseOffer(b);
+    foreach (var o in SeatOffer.Where(o => o.Booking == b).ToList()) { o.Delete(); }
+    b.Delete();
+  }
+  UnitOfWork.Commit();
+  foreach (var s in freed) { PassOn(s); }
+  return mine.Count;
+}

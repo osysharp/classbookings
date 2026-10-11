@@ -1,0 +1,24 @@
+// The kit's pages, served at their routes in the app's own shell and theme.
+//
+// ⚑ AN APP TAKES ONE OVER by declaring a component of the same name — with a `[Route]` of its own it is served there
+//   instead, in its own frame; without one, the kit's route serves the app's version:
+//
+//     [Route("/classes")] [Title("Classes")] [Render(CSR)]
+//     component TimetablePage() { render { MyFrame { TimetableScreen(days: 7); } } }
+//
+//   The screens (`TimetableScreen`, `MyBookingsScreen`, `RegisterScreen`, `SessionRow`) are the parts to place on a page
+//   of the app's own.
+
+namespace Osysharp.ClassBookings;
+
+using Osysharp.Ui;
+
+[Route("/timetable")] [Title("Timetable")] [Render(CSR)]
+public component TimetablePage() { render { TimetableScreen(); } }
+
+[Route("/my-bookings")] [Title("My bookings")] [Render(CSR)]
+public component MyBookingsPage() { render { MyBookingsScreen(); } }
+
+/// The register — for whoever takes registers, and for instructors, who see their own sessions on it.
+[Route("/register")] [Title("Register")] [Render(CSR)]
+public component RegisterPage() { render { RegisterScreen(); } }

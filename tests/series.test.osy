@@ -1,0 +1,79 @@
+// A weekly course: planned ahead in the school's own time zone, booked whole, changed one meeting at a time, ended.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.ClassBookings;
+
+/// The school runs a six-week Thursday supper course at 18:00 London time, led by Chef Sam in Kitchen 1.
+[TestFixture]
+void ACourse() {
+  var w = SeedSchool();
+  var today = DateOnly.FromDateTime(DateTime.UtcNow);
+  new SessionSeries {
+    Title = "Thursday suppers", TimeZone = Zone.Of("Europe/London"), Day = DayOfWeek.Thursday, StartsAt = new TimeOnly(18, 0),
+    Length = TimeSpan.FromHours(2), Capacity = 6, From = today.AddDays(1), Until = today.AddDays(42), Lead = w.ChefSam,
+  };
+}
+
+SessionSeries Course() { return SessionSeries.Single(s => s.Title == "Thursday suppers"); }
+
+[Test(ACourse)]
+void planning_makes_each_thursday_at_six_in_london_as_the_schools_own_class() {
+  runas (Omar) {
+    var plan = PlanSeries(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(60));
+    Assert.Equal(6, plan.Made);
+    Assert.Equal(0, plan.Clashes.Count);
+    var made = UpcomingOf(Course());
+    Assert.Equal(6, made.Count);
+    var london = Zone.Of("Europe/London");
+    foreach (var s in made) {
+      Assert.Equal(18, s.StartsAt.InZone(london).Hour);          // through the clocks going back, too
+      Assert.Equal(DayOfWeek.Thursday, s.StartsAt.InZone(london).DayOfWeek);
+      Assert.Equal("Chef Sam", HeldBy(s));
+      Assert.Equal(6, s.Capacity);
+    }
+    Assert.Equal(6, CookingClass.Count(c => c.Cuisine == "Course"));
+  }
+}
+
+[Test(ACourse)]
+void planning_again_makes_nothing_twice_and_keeps_a_moved_meeting_where_it_was_moved() {
+  runas (Omar) {
+    var firstPlan = PlanSeries(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(20));
+    var first = UpcomingOf(Course())[0];
+    MoveSession(first, first.StartsAt.AddDays(1));                  // this week's supper is on Friday instead
+    var again = PlanSeries(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(60));
+    Assert.Equal(6 - firstPlan.Made, again.Made);
+    Assert.Equal(6, UpcomingOf(Course()).Count);
+    Assert.Equal(1, UpcomingOf(Course()).Count(s => s.StartsAt.InZone(Zone.Of("Europe/London")).DayOfWeek == DayOfWeek.Friday));
+  }
+}
+
+[Test(ACourse)]
+void a_day_the_chef_is_busy_is_still_planned_and_named() {
+  runas (Omar) {
+    var firstDay = SeriesDays(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(10))[0];
+    var clash = new CookingClass { Title = "Private dinner", StartsAt = Course().TimeZone.Resolve(firstDay, new TimeOnly(18, 30)), Capacity = 10 };
+    UnitOfWork.Commit();
+    AssignResource(Cls("Private dinner"), Res("Chef Sam"));
+    var plan = PlanSeries(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(60));
+    Assert.Equal(6, plan.Made);
+    Assert.Equal(1, plan.Clashes.Count);
+    Assert.Contains("Private dinner", plan.Clashes[0]);
+  }
+}
+
+[Test(ACourse)]
+void a_member_books_the_whole_course_and_the_desk_ends_it_early() {
+  runas (Omar) { PlanSeries(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(60)); }
+  runas (Ana) {
+    var outcomes = BookSeries(Course(), Ana);
+    Assert.Equal(6, outcomes.Count(o => o.Result == BookingResult.Booked));
+  }
+  runas (Omar) {
+    var fromWeek4 = UpcomingOf(Course())[3].OccurrenceOn!.Value;
+    Assert.Equal(3, EndSeries(Course(), fromWeek4));
+    Assert.Equal(3, UpcomingOf(Course()).Count(s => !s.Cancelled));
+    Assert.Equal(0, PlanSeries(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(90)).Made);
+  }
+  Assert.Equal(3, HeardCount("cancelled"));
+}
