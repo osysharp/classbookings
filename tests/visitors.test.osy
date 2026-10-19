@@ -1,0 +1,83 @@
+// What somebody who has not signed in is told about how full a session is — nothing, until the app says they may be —
+// and what the app hears when a session's places change.
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.ClassBookings;
+
+/// The school, and a taster evening with two places that it shows to everyone.
+[TestFixture]
+void TasterEvening() {
+  SeedSchool();
+  new Taster { Title = "Taster", StartsAt = DateTime.UtcNow.AddDays(4), Capacity = 2 };
+}
+
+// Found in a real build: the count is worked out from the rows of bookings, a visitor reads none of them, and so a
+// visitor was told every place was free — "2 places left" on an evening with one. The app kept two numbers of its own.
+[Test(TasterEvening)]
+void a_visitor_is_not_told_a_number_that_is_wrong() {
+  // Nobody is signed in here. The school shows the evening itself to everyone — and has not said that visitors see
+  // how full a session is, so asking is refused whether or not anybody has booked: a visitor learns nothing from
+  // WHEN the refusals begin.
+  Assert.Equal("Taster", Taster.Single().Title);
+  Assert.Throws<NotAuthorized>(() => PlacesLeft(Taster.Single()));
+
+  runas (Ana) { BookSession(Taster.Single(), Ana); }
+
+  // Refused with what the app says to allow it — never answered "2".
+  var refused = Assert.Throws<NotAuthorized>(() => PlacesLeft(Taster.Single()));
+  Assert.Contains("policy VisitorsSeePlacesLeft => true;", refused.Message);
+  Assert.Throws<NotAuthorized>(() => WaitingCount(Taster.Single()));
+  // Somebody signed in is told, as before.
+  runas (Ben) { Assert.Equal(1, PlacesLeft(Taster.Single())); }
+
+  // Ana is forgotten, and with her the only booking there was: every place is free again — which somebody signed in
+  // is told, and a visitor still is not.
+  runas (Omar) { ForgetBookingsOf(Ana); }
+  runas (Ben) { Assert.Equal(2, PlacesLeft(Taster.Single())); }
+  Assert.Throws<NotAuthorized>(() => PlacesLeft(Taster.Single()));
+}
+
+[Test(TasterEvening)]
+void once_the_app_says_so_a_visitor_sees_how_full_a_session_is_and_never_who_is_in_it() {
+  runas (Ana) { BookSession(Taster.Single(), Ana); }
+  runas (Ben) { BookSession(Taster.Single(), Ben); }
+  runas (Cy) { BookSession(Taster.Single(), Cy); }
+  runas (Omar) { new OpenDoor(); UnitOfWork.Commit(); }
+
+  // Nobody is signed in here.
+  Assert.Equal(0, PlacesLeft(Taster.Single()));
+  Assert.Equal(1, WaitingCount(Taster.Single()));
+  // The rows a visitor counts say nothing of whose they are, nor when.
+  var rows = Booking.Where(b => b.Session.Id == Taster.Single().Id).ToList();
+  Assert.Equal(3, rows.Count);
+  foreach (var row in rows) {
+    Assert.Null(row.Person);
+    Assert.Null(row.BookedBy);
+    Assert.Null(row.OfferExpiresAt);
+  }
+  // …and seeing is all it is: a visitor writes nothing.
+  Assert.Denied(() => { SetSeat(rows[0], 2); UnitOfWork.Commit(); });
+
+  // A place is added: the visitor's count follows by itself.
+  runas (Omar) { SetCapacity(Taster.Single(), 4); }
+  Assert.Equal(1, PlacesLeft(Taster.Single()));    // one of the two new places is held for Cy, who was waiting
+  Assert.Equal(0, WaitingCount(Taster.Single()));
+}
+
+// Found in the same build: `SetCapacity` told the app nothing, so whatever an app kept or showed about a session's
+// places went stale until somebody looked again.
+[Test(School)]
+void changing_a_sessions_places_is_heard_with_how_many_it_had() {
+  runas (Ana) { BookSession(Cls("Pasta"), Ana); }
+  runas (Omar) { SetCapacity(Cls("Pasta"), 5); }
+  Assert.Equal(1, HeardCount("places"));
+  Assert.Equal(1, HeardCount("places-from-2"));
+  // The app's own handler counted the places again when it heard: five, one of them Ana's.
+  Assert.Equal(1, HeardCount("places-left-4"));
+  // Setting it to what it already is changes nothing, and says nothing.
+  runas (Omar) { SetCapacity(Cls("Pasta"), 5); }
+  Assert.Equal(1, HeardCount("places"));
+  // A change that is refused is not heard either.
+  runas (Omar) { Assert.Throws(() => SetCapacity(Cls("Pasta"), 0)); }
+  Assert.Equal(1, HeardCount("places"));
+}

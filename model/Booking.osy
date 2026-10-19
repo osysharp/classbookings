@@ -76,15 +76,27 @@ int NextTicket(BookableSession session) {
   return (top ?? 0) + 1;
 }
 
-/// How many places of the session are free right now (0 for a cancelled session).
+/// Refuse a count to a visitor — somebody who is not signed in — in an app that has not said visitors see how full a
+/// session is. A count is worked out from the rows of bookings, and a visitor reads none of them: answered, they would
+/// be told every place is free. The app's own handlers and clocks have nobody signed in either, and read every row:
+/// `IsTheApp` is what tells them from a visitor.
+void CountsAreMineToSee() {
+  if (IsTheApp || CurrentPrincipal() != null || VisitorsSeePlacesLeft) { return; }
+  throw new NotAuthorized("How full a session is, is shown to people who have signed in. To show it to everyone, the app says: policy VisitorsSeePlacesLeft => true;");
+}
+
+/// How many places of the session are free right now (0 for a cancelled session). Somebody who has not signed in is
+/// refused unless the app says `policy VisitorsSeePlacesLeft => true;`.
 public int PlacesLeft(BookableSession session) {
+  CountsAreMineToSee();
   if (session.Cancelled) { return 0; }
   var held = Booking.Count(b => b.Session == session && b.Seat != null);
   return Math.Max(0, session.Capacity - held);
 }
 
-/// How many people are waiting for a place in the session.
+/// How many people are waiting for a place in the session. Refused to a visitor as `PlacesLeft` is.
 public int WaitingCount(BookableSession session) {
+  CountsAreMineToSee();
   return Booking.Count(b => b.Session == session && b.State == BookingState.Waiting);
 }
 
@@ -379,7 +391,7 @@ public int CancelSession(BookableSession session) {
 }
 
 /// Change how many places a session has. Refused with the sentence to show when a held place would no longer exist, or
-/// the session's room holds fewer; more places go to the people waiting at once.
+/// the session's room holds fewer; more places go to the people waiting at once, and the app hears `PlacesChanged`.
 [Server, Authorize(ManagesSessions)]
 public void SetCapacity(BookableSession session, int capacity) {
   if (capacity < 0) { throw new ValidationException("A session cannot have fewer than no places."); }
@@ -391,9 +403,11 @@ public void SetCapacity(BookableSession session, int capacity) {
   if (tooSmall != null && capacity > tooSmall) {
     throw new ValidationException($"The session's resources hold {tooSmall} at most.");
   }
+  var from = session.Capacity;
   session.Capacity = capacity;
   UnitOfWork.Commit();
   PassOn(session);
+  if (from != capacity) { Raise(new PlacesChanged { Session = session, From = from }); }
 }
 
 /// Forget a person: every booking they hold or held goes — for an erasure request, or someone who left. Freed places

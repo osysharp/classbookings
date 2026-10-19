@@ -37,7 +37,7 @@ public component MyBookingsScreen() {
       if (notice != "") { Alert(notice); }
       var coming = lines.Where(l => !l.Past && (l.State == BookingState.Booked || l.State == BookingState.Offered || l.State == BookingState.Waiting)).ToList();
       var earlier = lines.Where(l => l.Past || l.State == BookingState.Cancelled || l.State == BookingState.Attended || l.State == BookingState.NoShow).ToList();
-      Stack(gap: 0, role: UiRole.List, label: "Coming up") {
+      Stack(gap: 0, role: (coming.Count == 0) ? UiRole.Group : UiRole.List, label: "Coming up") {
         SectionLabel("Coming up");
         if (coming.Count == 0) { EmptyState("Nothing booked", body: "Book a session on the timetable."); }
         foreach (var l in coming) {

@@ -21,6 +21,13 @@ virtual policy BooksSessions => IsAuthenticated;
 /// `policy BooksFor(Principal person) => person == user || ActsForDependant(person);`.
 virtual policy BooksFor(Principal person) => person == user;
 
+/// THE SEAM — may somebody who has NOT signed in be told how full a session is: how many places are left and how many
+/// people are waiting — never who they are. Nobody, until the app says: `policy VisitorsSeePlacesLeft => true;`. It opens
+/// the rows of bookings to a visitor with every column that says whose they are hidden. Showing the SESSION to a
+/// visitor is the app's own grant on its session type; without this one, a visitor who asks for a count is refused
+/// (`PlacesLeft`, `WaitingCount`) rather than told that every place is free.
+virtual policy VisitorsSeePlacesLeft => false;
+
 /// How the app configures the kit: `app.ClassBookings = new ClassBookingsSetup { CancelFreeUntil = TimeSpan.FromHours(24) };`.
 /// Every member has a working default.
 [AppSetting("ClassBookings")]
@@ -184,6 +191,8 @@ public entity Booking {
     // Everybody signed in reads the rows, so counts and free places can be worked out as anybody — but who holds a row,
     // who booked it and when are hidden from everyone but the person, those who booked or act for them, and the staff.
     allow read when IsAuthenticated;
+    // …and, where the app says so, somebody who has not signed in: the same rows, for the same counts, with nobody in them.
+    allow read when VisitorsSeePlacesLeft;
     deny read Person, BookedBy, CreatedAt, OfferedAt, OfferExpiresAt, CancelledAt, CheckedInAt when !TakesAttendance
       where Person != user && BookedBy != user && !BooksFor(this.Person) && !TeachesSession(this.Session);
     // Every column is closed to a direct write; the kit's functions are the only way in.
@@ -226,6 +235,12 @@ public sealed class LateCancellation { public Booking Booking; }
 /// The session was cancelled; every booking of it was cancelled first (each heard as BookingCancelled).
 [Event("Session cancelled")]
 public sealed class SessionCancelled { public BookableSession Session; }
+
+/// The session's number of places changed (`From` is how many it had). Places that were added have already gone to the
+/// people waiting — each of them heard as PlaceOffered or BookingConfirmed — so this is for whatever the app keeps or
+/// shows about the session itself: `[On] void Recount(PlacesChanged e) { … }`.
+[Event("Places changed")]
+public sealed class PlacesChanged { public BookableSession Session; public int From; }
 
 /// The session moved; everyone booked or waiting should be told. `From` is when it started before.
 [Event("Session moved")]

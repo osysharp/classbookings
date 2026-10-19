@@ -18,8 +18,8 @@
 //   …and adds booking rules by implementing `IBookingRule` (found, never wired). Money is the app's: a late cancellation
 //   or a no-show is an event it charges for with its own payments.
 package Osysharp.ClassBookings {
-  version     "0.1.0";
-  minPlatform "0.9.0";
+  version     "0.4.0";
+  minPlatform "0.14.0";
   summary     "bookable sessions with numbered places that are never overbooked — a first-come waiting list whose freed places are offered for a limited time (or given at once) on a durable clock, booking windows, late cancellation and no-shows heard as events for the app to charge, check-in, walk-ins and the register closing by itself, weekly series in the app's time zone with one-off changes, instructors, rooms and equipment that no two sessions hold at once, reminders before a session, app-defined booking rules, booking for the people one acts for — with a timetable, a my-bookings page and the register.";
   pairsWith   "Osysharp.Guardianship: parents book classes and courses for the children they act for";
   model "model/**/*.osy";

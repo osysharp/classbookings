@@ -14,6 +14,14 @@ policy TakesAttendance => IsDesk;
 policy BooksFor(Principal person) => person == user || ActsForDependant(person);
 policy ManagesGuardianships => IsDesk;
 policy MakesManagedAccounts => IsAuthenticated;
+// The school shows how full a session is to everyone once it says so — a row, so a test can see both sides.
+policy VisitorsSeePlacesLeft => OpenDoor.Any();
+
+/// The school has decided that anyone may see how full its sessions are.
+entity OpenDoor {
+  bool Open = true;
+  security { allow read when IsAuthenticated || IsAnonymous; allow create, delete when IsDesk; }
+}
 
 app.Accounts = new AccountsSetup { AppName = "Larder Cookery School", SignupRole = AppRole.Member };
 
@@ -23,6 +31,14 @@ entity CookingClass : BookableSession {
   bool NeedsKnifeSkills = false;
   security {
     allow read when IsAuthenticated;
+    allow create, update when ManagesSessions;
+  }
+}
+
+/// A free taster evening: the school shows it to everyone, signed in or not.
+entity Taster : BookableSession {
+  security {
+    allow read when IsAuthenticated || IsAnonymous;
     allow create, update when ManagesSessions;
   }
 }
@@ -89,6 +105,13 @@ entity Heard {
 [On] void HearCancelled(BookingCancelled e) { new Heard { Kind = "cancelled", About = e.Booking.Id }; UnitOfWork.Commit(); }
 [On] void HearLate(LateCancellation e) { new Heard { Kind = "late", About = e.Booking.Id }; UnitOfWork.Commit(); }
 [On] void HearSessionCancelled(SessionCancelled e) { new Heard { Kind = "session-cancelled", About = e.Session.Id }; UnitOfWork.Commit(); }
+// …and what an app does with it: count again, from its own handler.
+[On] void HearPlaces(PlacesChanged e) {
+  new Heard { Kind = "places", About = e.Session.Id };
+  new Heard { Kind = "places-from-" + e.From, About = e.Session.Id };
+  new Heard { Kind = "places-left-" + PlacesLeft(e.Session), About = e.Session.Id };
+  UnitOfWork.Commit();
+}
 [On] void HearMoved(SessionMoved e) { new Heard { Kind = "moved", About = e.Session.Id }; UnitOfWork.Commit(); }
 [On] void HearReminder(SessionReminder e) { new Heard { Kind = "reminder", About = e.Booking.Id }; UnitOfWork.Commit(); }
 [On] void HearCheckedIn(CheckedIn e) { new Heard { Kind = "checked-in", About = e.Booking.Id }; UnitOfWork.Commit(); }

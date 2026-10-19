@@ -59,12 +59,19 @@ class MembersOnlyForAdvanced : IBookingRule {
 }
 
 [On] void ChargeLate(LateCancellation e) { /* take the fee with your payments kit */ }
+[On] void Recount(PlacesChanged e) { /* a session got more or fewer places: e.Session, and e.From it had before */ }
 ```
 
 Parents booking for children: add Osysharp.Guardianship and say
 `policy BooksFor(Principal person) => person == user || ActsForDependant(person);`, and derive `SessionPeople` so the
 timetable offers them (`BookableBy(me) => MeAndMyDependants()`). Walk-ins who never sign in: override
 `SessionPeople.NewWalkIn(name)` with Osysharp.UserAccounts' `MakeManagedAccount`.
+
+**Showing how full a class is to people who have not signed in** is the app's decision, and off until it says so:
+give visitors the class itself with your own grant (`allow read when IsAuthenticated || IsAnonymous;` on your session
+type), then `policy VisitorsSeePlacesLeft => true;`. A visitor then gets the same counts as anyone — `PlacesLeft`,
+`WaitingCount`, the timetable — and never who holds a place. Without it a visitor who asks is refused, not told that
+every place is free.
 
 The pages are served at `/timetable`, `/my-bookings` and `/register`. Take one over by declaring a component of the same
 name, or place `TimetableScreen()`, `MyBookingsScreen()`, `RegisterScreen()` on pages of your own. Every colour and size
@@ -92,5 +99,5 @@ instructor) shaped resources and clash checks.
 ## Source and tests
 
 `model/` is the kit; `tests/` is a cookery school that uses it (with Osysharp.Guardianship for parents and
-Osysharp.UserAccounts for walk-ins) — 60 tests as real people, six of them driving the pages.
+Osysharp.UserAccounts for walk-ins) — 63 tests as real people, six of them driving the pages.
 `osy test` in `tests/`; `--pixels` for the screenshots above.
