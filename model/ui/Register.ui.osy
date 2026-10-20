@@ -16,10 +16,12 @@ public class RegisterSession {
   public int Capacity;
 }
 
-/// Today's sessions (from an hour ago) whose register the caller may take, soonest first.
+/// Today's sessions whose register the caller may take, soonest first: from three hours ago, for a day. A rolling day,
+/// not the UTC date — at a desk east of Greenwich the UTC date turns over in the evening, and a class ten minutes away
+/// vanished from the register until midnight UTC had passed (measured: the kit's own register test, run at 23:55 UTC).
 public List<RegisterSession> RegistersToday() {
   var from = DateTime.UtcNow.AddHours(-3);
-  var until = DateTime.UtcNow.Date.AddDays(1);
+  var until = from.AddHours(24);
   List<RegisterSession> found = [];
   foreach (var s in BookableSession.Where(s => s.StartsAt >= from && s.StartsAt < until && !s.Cancelled).OrderBy(s => s.StartsAt).Take(100).ToList()) {
     if (!MayTakeRegister(s)) { continue; }
