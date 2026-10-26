@@ -9,7 +9,7 @@ void ACourse() {
   var w = SeedSchool();
   var today = DateOnly.FromDateTime(DateTime.UtcNow);
   new SessionSeries {
-    Title = "Thursday suppers", TimeZone = Zone.Of("Europe/London"), Day = DayOfWeek.Thursday, StartsAt = new TimeOnly(18, 0),
+    Title = "Thursday suppers", TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Europe/London"), Day = DayOfWeek.Thursday, StartsAt = new TimeOnly(18, 0),
     Length = TimeSpan.FromHours(2), Capacity = 6, From = today.AddDays(1), Until = today.AddDays(42), Lead = w.ChefSam,
   };
 }
@@ -24,10 +24,10 @@ void planning_makes_each_thursday_at_six_in_london_as_the_schools_own_class() {
     Assert.Equal(0, plan.Clashes.Count);
     var made = UpcomingOf(Course());
     Assert.Equal(6, made.Count);
-    var london = Zone.Of("Europe/London");
+    var london = TimeZoneInfo.FindSystemTimeZoneById("Europe/London");
     foreach (var s in made) {
-      Assert.Equal(18, s.StartsAt.InZone(london).Hour);          // through the clocks going back, too
-      Assert.Equal(DayOfWeek.Thursday, s.StartsAt.InZone(london).DayOfWeek);
+      Assert.Equal(18, TimeZoneInfo.ConvertTimeFromUtc(s.StartsAt, london).Hour);          // through the clocks going back, too
+      Assert.Equal(DayOfWeek.Thursday, TimeZoneInfo.ConvertTimeFromUtc(s.StartsAt, london).DayOfWeek);
       Assert.Equal("Chef Sam", HeldBy(s));
       Assert.Equal(6, s.Capacity);
     }
@@ -44,7 +44,7 @@ void planning_again_makes_nothing_twice_and_keeps_a_moved_meeting_where_it_was_m
     var again = PlanSeries(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(60));
     Assert.Equal(6 - firstPlan.Made, again.Made);
     Assert.Equal(6, UpcomingOf(Course()).Count);
-    Assert.Equal(1, UpcomingOf(Course()).Count(s => s.StartsAt.InZone(Zone.Of("Europe/London")).DayOfWeek == DayOfWeek.Friday));
+    Assert.Equal(1, UpcomingOf(Course()).Count(s => TimeZoneInfo.ConvertTimeFromUtc(s.StartsAt, TimeZoneInfo.FindSystemTimeZoneById("Europe/London")).DayOfWeek == DayOfWeek.Friday));
   }
 }
 
@@ -52,7 +52,7 @@ void planning_again_makes_nothing_twice_and_keeps_a_moved_meeting_where_it_was_m
 void a_day_the_chef_is_busy_is_still_planned_and_named() {
   runas (Omar) {
     var firstDay = SeriesDays(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(10))[0];
-    var clash = new CookingClass { Title = "Private dinner", StartsAt = Course().TimeZone.Resolve(firstDay, new TimeOnly(18, 30)), Capacity = 10 };
+    var clash = new CookingClass { Title = "Private dinner", StartsAt = TimeZoneInfo.ConvertTimeToUtc(firstDay.ToDateTime(new TimeOnly(18, 30)), Course().TimeZone), Capacity = 10 };
     UnitOfWork.Commit();
     AssignResource(Cls("Private dinner"), Res("Chef Sam"));
     var plan = PlanSeries(Course(), DateOnly.FromDateTime(DateTime.UtcNow).AddDays(60));

@@ -9,7 +9,7 @@ using Osysharp.Identity;
 /// until `Until` (or for as long as it is planned). Daylight saving is the zone's: 18:00 stays 18:00 all year.
 public entity SessionSeries {
   [Required, MaxLength(160)] string Title;
-  Zone TimeZone;
+  TimeZoneInfo TimeZone;
   DayOfWeek Day;
   TimeOnly StartsAt;
   TimeSpan Length = TimeSpan.FromHours(1);
@@ -56,7 +56,7 @@ public SeriesPlan PlanSeries(SessionSeries series, DateOnly through) {
   var made = BookableSession.Where(s => s.Series == series).Select(s => s.OccurrenceOn).Take(1000).ToList();
   foreach (var day in SeriesDays(series, through)) {
     if (made.Contains(day)) { continue; }
-    var starts = series.TimeZone.Resolve(day, series.StartsAt);
+    var starts = TimeZoneInfo.ConvertTimeToUtc(day.ToDateTime(series.StartsAt), series.TimeZone);
     if (starts <= DateTime.UtcNow) { continue; }
     var session = maker.New(series.Title, starts, starts + series.Length, series.Capacity);
     session.Series = series;
