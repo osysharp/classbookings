@@ -101,3 +101,94 @@ instructor) shaped resources and clash checks.
 `model/` is the kit; `tests/` is a cookery school that uses it (with Osysharp.Guardianship for parents and
 Osysharp.UserAccounts for walk-ins) — 63 tests as real people, six of them driving the pages.
 `osy test` in `tests/`; `--pixels` for the screenshots above.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.ClassBookings;
+
+[Test(School)]
+void places_are_given_lowest_first_and_the_next_person_waits_when_full() {
+  runas (Ana) {
+    var got = BookSession(Cls("Pasta"), Ana);
+    Assert.Equal(BookingResult.Booked, got.Result);
+    Assert.Equal(1, got.Booking!.Seat);
+    Assert.Equal(1, PlacesLeft(Cls("Pasta")));
+  }
+  runas (Ben) { Assert.Equal(2, BookSession(Cls("Pasta"), Ben).Booking!.Seat); }
+  runas (Cy) {
+    var got = BookSession(Cls("Pasta"), Cy);
+    Assert.Equal(BookingResult.Waitlisted, got.Result);
+    Assert.Null(got.Booking!.Seat);
+    Assert.Equal(1, QueuePosition(got.Booking!));
+    Assert.Contains("waiting list", got.Message);
+    Assert.Equal(0, PlacesLeft(Cls("Pasta")));
+  }
+  Assert.Equal(2, HeardCount("confirmed"));
+  Assert.Equal(1, HeardCount("waitlist"));
+}
+```
+
+From [`tests/booking.test.osy`](tests/booking.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Guardianship;
+using Osysharp.ClassBookings;
+
+[Test(School)]
+void a_parent_books_her_son_and_the_booking_records_who_booked() {
+  runas (Ana) {
+    var got = BookSession(Cls("Kids' bread"), Leo);
+    Assert.Equal(BookingResult.Booked, got.Result);
+    Assert.Equal(Ana.Id, got.Booking!.BookedBy!.Id);
+    Assert.Equal(1, MyBookings().Count(l => l.Person == "Leo"));
+  }
+  runas (Ben) {
+    var refused = BookSession(Cls("Kids' bread"), Leo);
+    Assert.Equal(BookingResult.Refused, refused.Result);
+    Assert.Contains("someone you act for", refused.Message);
+  }
+}
+```
+
+From [`tests/family.test.osy`](tests/family.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Workflow;
+using Osysharp.ClassBookings;
+
+[Test(AtTheDoor)]
+void the_desk_checks_people_in_and_the_school_hears_it() {
+  runas (Omar) {
+    var got = CheckIn(Mine("Tonight", Ana));
+    Assert.Equal(BookingResult.CheckedIn, got.Result);
+    Assert.Equal(BookingState.Attended, Mine("Tonight", Ana).State);
+    Assert.NotNull(Mine("Tonight", Ana).CheckedInAt);
+    Assert.Equal(BookingResult.NothingToDo, CheckIn(Mine("Tonight", Ana)).Result);
+    UndoCheckIn(Mine("Tonight", Ana));
+    Assert.Equal(BookingState.Booked, Mine("Tonight", Ana).State);
+  }
+  Assert.Equal(1, HeardCount("checked-in"));
+}
+```
+
+From [`tests/register.test.osy`](tests/register.test.osy).
+
+## Learn more
+
+- [The Osysharp.ClassBookings reference](https://osysharp.com/reference/scheduling/class-bookings-kit/)
+- [Osysharp.ClassBookings in the package catalogue](https://osysharp.com/packages/#osysharp-classbookings)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
